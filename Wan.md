@@ -12,10 +12,6 @@ cd checkpoints
 wget https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/resolve/main/Wan2.1_VAE.pth
 wget https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth
 
-# Reproduced rCM models
-wget https://huggingface.co/worstcoder/rcm-Wan/resolve/main/rCM_Wan2.1_T2V_1.3B_480p.pt
-wget https://huggingface.co/worstcoder/rcm-Wan/resolve/main/rCM_Wan2.1_T2V_14B_480p.pt
-
 cd ..
 ```
 

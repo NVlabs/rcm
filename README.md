@@ -62,7 +62,7 @@ PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
     --prompt "A cinematic shot of a snowy mountain at sunrise"
 ```
 
-We provide reproduced rCM models for Wan at [rcm-Wan · Hugging Face](https://huggingface.co/worstcoder/rcm-Wan). See [Wan examples](Wan.md) for additional usage examples.
+See [Wan examples](Wan.md) for additional examples.
 
 ## Training
 The full distillation pipeline still requires refactoring. We provide essential reference code for key components:
