@@ -34,7 +34,8 @@ rCM achieves both high quality and strong diversity.
 This codebase is built on top of [Cosmos-Predict2](https://github.com/nvidia-cosmos/cosmos-predict2). Please follow its environment setup instructions.
 
 ## Inference
-An example inference script for rCM on Wan2.1 T2V models:
+
+This is an unofficial but faithfully reproduced rCM model with Wan, available at [rcm-Wan · Hugging Face](https://huggingface.co/worstcoder/rcm-Wan). Below is an example inference script for running rCM on T2V:
 
 ```bash
 # Basic usage:
@@ -62,7 +63,7 @@ PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
     --prompt "A cinematic shot of a snowy mountain at sunrise"
 ```
 
-We provide reproduced rCM models for Wan at [rcm-Wan · Hugging Face](https://huggingface.co/worstcoder/rcm-Wan). See [Wan examples](Wan.md) for additional usage examples.
+See [Wan examples](Wan.md) for additional usage examples.
 
 ## Training
 The full distillation pipeline still requires refactoring. We provide essential reference code for key components:
