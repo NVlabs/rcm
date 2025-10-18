@@ -185,7 +185,9 @@ if __name__ == "__main__":
         generator=generator,
     )
 
-    mid_t = [1.3, 1.0, 0.6][: args.num_steps - 1]
+    # mid_t = [1.3, 1.0, 0.6][: args.num_steps - 1]
+    # For better visual quality
+    mid_t = [1.5, 1.4, 1.0][: args.num_steps - 1]
 
     t_steps = torch.tensor(
         [math.atan(args.sigma_max), *mid_t, 0],
