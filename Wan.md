@@ -17,6 +17,8 @@ cd ..
 
 ## Generation Examples
 
+### 14B 480p
+
 #### Example 1
 Command:
 ```bash
@@ -89,3 +91,75 @@ PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
 ```
 Output video:
 <video src="https://github.com/user-attachments/assets/9376b429-75be-4ba2-8b58-dcd2fd2e7b83" controls></video>
+
+### 14B 720p
+
+#### Example 1
+Command:
+```bash
+PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
+    --dit_path checkpoints/rCM_Wan2.1_T2V_14B_720p.pt \
+    --model_size 14B \
+    --num_samples 4 \
+    --resolution 720p \
+    --sigma_max 120 \
+    --prompt "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."
+```
+Output video:
+<video src="https://github.com/user-attachments/assets/b7b742a1-2f84-417c-b3ce-f99f5ffaeaa5" controls></video>
+
+#### Example 2
+Command:
+```bash
+PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
+    --dit_path checkpoints/rCM_Wan2.1_T2V_14B_720p.pt \
+    --model_size 14B \
+    --num_samples 4 \
+    --resolution 720p \
+    --sigma_max 120 \
+    --prompt "A close up view of a glass sphere that has a zen garden within it. There is a small dwarf in the sphere who is raking the zen garden and creating patterns in the sand."
+```
+Output video:
+<video src="https://github.com/user-attachments/assets/d4387c5f-8e10-47ea-a050-912d9802e3e5" controls></video>
+
+#### Example 3
+Command:
+```bash
+PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
+    --dit_path checkpoints/rCM_Wan2.1_T2V_14B_720p.pt \
+    --model_size 14B \
+    --num_samples 4 \
+    --resolution 720p \
+    --sigma_max 120 \
+    --prompt "an alarm clock"
+```
+Output video:
+<video src="https://github.com/user-attachments/assets/86eb6a3e-4ce6-42e6-8110-02def012f47a" controls></video>
+
+#### Example 4
+Command:
+```bash
+PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
+    --dit_path checkpoints/rCM_Wan2.1_T2V_14B_720p.pt \
+    --model_size 14B \
+    --num_samples 4 \
+    --resolution 720p \
+    --sigma_max 120 \
+    --prompt "Low drone footage over a bustling Tuscan town square, people laughing, dogs running around"
+```
+Output video:
+<video src="https://github.com/user-attachments/assets/c47231e3-521d-4fd9-bc59-806450cdb8ed" controls></video>
+
+#### Example 5
+Command:
+```bash
+PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
+    --dit_path checkpoints/rCM_Wan2.1_T2V_14B_720p.pt \
+    --model_size 14B \
+    --num_samples 4 \
+    --resolution 720p \
+    --sigma_max 120 \
+    --prompt "A video featuring a woman introducing the iPhone 15, available for purchase on Shopee. The woman has a friendly and engaging demeanor, speaking clearly and confidently about the phone's features and benefits. She demonstrates the phone's camera capabilities, display quality, and user interface. The background includes subtle animations of the Shopee app and product listings. The woman wears casual, modern clothing and maintains a neutral facial expression as she interacts with the phone. The video opens with a close-up of the woman’s face, then transitions to medium shots of her handling the phone. The camera occasionally zooms in on specific features of the iPhone 15."
+```
+Output video:
+<video src="https://github.com/user-attachments/assets/7979a411-644e-4956-aee9-98d9adc1f1f5" controls></video>
