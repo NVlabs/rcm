@@ -24,19 +24,12 @@ from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
-from torchvision import transforms
 
 from imaginaire.utils import log
 from rcm.utils.a2a_cp import MinimalA2AAttnOp
 from rcm.utils.selective_activation_checkpoint import CheckpointMode, SACConfig
 from rcm.utils.context_parallel import split_inputs_cp
-from rcm.utils.jvp_helper import (
-    JVP,
-    MinimalA2AAttnOpWithT,
-    TensorWithT,
-    naive_attention_op,
-    torch_attention_op,
-)
+from rcm.utils.jvp_helper import JVP, MinimalA2AAttnOpWithT, TensorWithT, naive_attention_op, torch_attention_op
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
@@ -138,7 +131,6 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
 
         Args:
             B_T_H_W_C (torch.Size): Input tensor size (Batch, Time, Height, Width, Channels).
-            fps (Optional[torch.Tensor], optional): Frames per second. Defaults to None.
             h_ntk_factor (Optional[float], optional): Height NTK factor. If None, uses self.h_ntk_factor.
             w_ntk_factor (Optional[float], optional): Width NTK factor. If None, uses self.w_ntk_factor.
             t_ntk_factor (Optional[float], optional): Time NTK factor. If None, uses self.t_ntk_factor.
@@ -216,7 +208,10 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
     cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
     sin = repeat(sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
     return torch.cat(
-        [x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]],
+        [
+            x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
+            x[..., ro_dim:],
+        ],
         dim=-1,
     )
 
@@ -303,13 +298,12 @@ class WanLayerNorm(JVP, nn.LayerNorm):
 
 
 class WanSelfAttention(JVP):
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, naive_attn=False):
+    def __init__(self, dim, num_heads, qk_norm=True, eps=1e-6, naive_attn=False):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
         self.qk_norm = qk_norm
@@ -452,8 +446,8 @@ class WanT2VCrossAttention(WanSelfAttention):
 
 
 class WanI2VCrossAttention(WanSelfAttention):
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, naive_attn=False):
-        super().__init__(dim, num_heads, window_size, qk_norm, eps, naive_attn)
+    def __init__(self, dim, num_heads, qk_norm=True, eps=1e-6, naive_attn=False):
+        super().__init__(dim, num_heads, qk_norm, eps, naive_attn)
 
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
@@ -546,39 +540,24 @@ class WanI2VCrossAttention(WanSelfAttention):
         return (x, t_x.detach())
 
 
-WAN_CROSSATTENTION_CLASSES = {
-    "t2v_cross_attn": WanT2VCrossAttention,
-    "i2v_cross_attn": WanI2VCrossAttention,
-}
+WAN_CROSSATTENTION_CLASSES = {"t2v_cross_attn": WanT2VCrossAttention, "i2v_cross_attn": WanI2VCrossAttention}
 
 
 class WanAttentionBlock(JVP):
-    def __init__(
-        self,
-        cross_attn_type,
-        dim,
-        ffn_dim,
-        num_heads,
-        window_size=(-1, -1),
-        qk_norm=True,
-        cross_attn_norm=False,
-        eps=1e-6,
-        naive_attn=False,
-    ):
+    def __init__(self, cross_attn_type, dim, ffn_dim, num_heads, qk_norm=True, cross_attn_norm=False, eps=1e-6, naive_attn=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
         self.num_heads = num_heads
-        self.window_size = window_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps, naive_attn)
+        self.self_attn = WanSelfAttention(dim, num_heads, qk_norm, eps, naive_attn)
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps, naive_attn)
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, qk_norm, eps, naive_attn)
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
 
@@ -596,16 +575,7 @@ class WanAttentionBlock(JVP):
         std = 1.0 / math.sqrt(self.dim)
         torch.nn.init.trunc_normal_(self.modulation, std=std)
 
-    def _forward(
-        self,
-        x,
-        e,
-        seq_lens,
-        video_size: VideoSize,
-        freqs,
-        context,
-        context_lens,
-    ):
+    def _forward(self, x, e, seq_lens, video_size: VideoSize, freqs, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
@@ -635,16 +605,7 @@ class WanAttentionBlock(JVP):
         x = cross_attn_ffn(x, context, context_lens, e)
         return x
 
-    def _forward_jvp(
-        self,
-        x: TensorWithT,
-        e: TensorWithT,
-        seq_lens,
-        video_size: VideoSize,
-        freqs,
-        context,
-        context_lens,
-    ):
+    def _forward_jvp(self, x: TensorWithT, e: TensorWithT, seq_lens, video_size: VideoSize, freqs, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
@@ -758,13 +719,7 @@ class MLPProj(torch.nn.Module):
     def __init__(self, in_dim, out_dim, flf_pos_emb=False):
         super().__init__()
 
-        self.proj = torch.nn.Sequential(
-            WanLayerNorm(in_dim),
-            nn.Linear(in_dim, in_dim),
-            nn.GELU(),
-            nn.Linear(in_dim, out_dim),
-            WanLayerNorm(out_dim),
-        )
+        self.proj = torch.nn.Sequential(WanLayerNorm(in_dim), nn.Linear(in_dim, in_dim), nn.GELU(), nn.Linear(in_dim, out_dim), WanLayerNorm(out_dim))
         if flf_pos_emb:  # NOTE: we only use this for `flf2v`
             self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
 
@@ -804,11 +759,9 @@ class WanModel_JVP(JVP):
         out_dim=16,
         num_heads=16,
         num_layers=32,
-        window_size=(-1, -1),
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
-        concat_padding_mask: bool = False,
         sac_config: SACConfig = SACConfig(),
         naive_attn: bool = False,
     ):
@@ -838,16 +791,12 @@ class WanModel_JVP(JVP):
                 Number of attention heads
             num_layers (`int`, *optional*, defaults to 32):
                 Number of transformer blocks
-            window_size (`tuple`, *optional*, defaults to (-1, -1)):
-                Window size for local attention (-1 indicates global attention)
             qk_norm (`bool`, *optional*, defaults to True):
                 Enable query/key normalization
             cross_attn_norm (`bool`, *optional*, defaults to False):
                 Enable cross-attention normalization
             eps (`float`, *optional*, defaults to 1e-6):
                 Epsilon value for normalization layers
-            concat_padding_mask (`bool`, *optional*, defaults to False):
-                Enable concat padding mask
         """
 
         super().__init__()
@@ -865,15 +814,12 @@ class WanModel_JVP(JVP):
         self.out_dim = out_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.window_size = window_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
-        self.concat_padding_mask = concat_padding_mask
         self.use_crossattn_projection = False
 
         # embeddings
-        in_dim = in_dim + 1 if self.concat_padding_mask else in_dim
         self.patch_embedding = nn.Linear(in_dim * patch_size[0] * patch_size[1] * patch_size[2], dim)
 
         self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
@@ -884,20 +830,7 @@ class WanModel_JVP(JVP):
         # blocks
         cross_attn_type = "t2v_cross_attn" if model_type == "t2v" else "i2v_cross_attn"
         self.blocks = nn.ModuleList(
-            [
-                WanAttentionBlock(
-                    cross_attn_type,
-                    dim,
-                    ffn_dim,
-                    num_heads,
-                    window_size,
-                    qk_norm,
-                    cross_attn_norm,
-                    eps,
-                    naive_attn,
-                )
-                for _ in range(num_layers)
-            ]
+            [WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads, qk_norm, cross_attn_norm, eps, naive_attn) for _ in range(num_layers)]
         )
 
         # head
@@ -908,12 +841,7 @@ class WanModel_JVP(JVP):
 
         d = dim // num_heads
 
-        self.rope_position_embedding = VideoRopePosition3DEmb(
-            head_dim=d,
-            len_h=128,
-            len_w=128,
-            len_t=32,
-        )
+        self.rope_position_embedding = VideoRopePosition3DEmb(head_dim=d, len_h=128, len_w=128, len_t=32)
 
         if model_type == "i2v" or model_type == "flf2v":
             self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == "flf2v")
@@ -928,12 +856,8 @@ class WanModel_JVP(JVP):
         x_B_C_T_H_W,
         timesteps_B_T,
         crossattn_emb,
-        seq_len=None,
         frame_cond_crossattn_emb_B_L_D=None,
         y_B_C_T_H_W=None,
-        padding_mask: Optional[torch.Tensor] = None,
-        is_uncond=False,
-        slg_layers=None,
         **kwargs,
     ):
         r"""
@@ -946,8 +870,6 @@ class WanModel_JVP(JVP):
                 Diffusion timesteps tensor of shape [B]
             context (List[Tensor]):
                 List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
             frame_cond_crossattn_emb_B_L_D (Tensor, *optional*):
                 CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y_B_C_T_H_W (Tensor, *optional*):
@@ -967,12 +889,6 @@ class WanModel_JVP(JVP):
         if y_B_C_T_H_W is not None:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, y_B_C_T_H_W], dim=1)
 
-        if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
-            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1)
-
         # embeddings
         x_B_T_H_W_D = rearrange(
             x_B_C_T_H_W,
@@ -987,8 +903,6 @@ class WanModel_JVP(JVP):
         video_size = VideoSize(T=x_B_T_H_W_D.shape[1], H=x_B_T_H_W_D.shape[2], W=x_B_T_H_W_D.shape[3])
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
-        seq_len = seq_lens.max().item()
-        assert seq_lens.max() == seq_len
 
         # time embeddings
         with amp.autocast("cuda", dtype=torch.float32):
@@ -1015,8 +929,6 @@ class WanModel_JVP(JVP):
         )
 
         for block_idx, block in enumerate(self.blocks):
-            if slg_layers is not None and block_idx in slg_layers and is_uncond:
-                continue
             x_B_L_D = block(x_B_L_D, **kwargs)
 
         # head
@@ -1043,35 +955,10 @@ class WanModel_JVP(JVP):
         x_B_C_T_H_W: TensorWithT,
         timesteps_B_T: TensorWithT,
         crossattn_emb,
-        seq_len=None,
         frame_cond_crossattn_emb_B_L_D=None,
         y_B_C_T_H_W=None,
-        padding_mask: Optional[torch.Tensor] = None,
-        is_uncond=False,
-        slg_layers=None,
         **kwargs,
     ):
-        r"""
-        Forward pass through the diffusion model
-
-        Args:
-            x_B_C_T_H_W (Tensor):
-                Input video tensor with shape [B, C_in, T, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
-            frame_cond_crossattn_emb_B_L_D (Tensor, *optional*):
-                CLIP image features for image-to-video mode or first-last-frame-to-video mode
-            y_B_C_T_H_W (Tensor, *optional*):
-                Conditional video inputs for image-to-video mode, shape [B, C_in, T, H, W]
-
-        Returns:
-            Tensor:
-                Denoised video tensor with shape [B, C_out, T, H / 8, W / 8]
-        """
         x_B_C_T_H_W_withT, timesteps_B_T_withT = x_B_C_T_H_W, timesteps_B_T
         x_B_C_T_H_W, t_x_B_C_T_H_W = x_B_C_T_H_W_withT
         timesteps_B_T, t_timesteps_B_T = timesteps_B_T_withT
@@ -1086,16 +973,6 @@ class WanModel_JVP(JVP):
         if y_B_C_T_H_W is not None:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, y_B_C_T_H_W], dim=1)
             t_x_B_C_T_H_W = torch.cat([t_x_B_C_T_H_W, torch.zeros_like(y_B_C_T_H_W)], dim=1)
-
-        if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
-            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1)
-            t_x_B_C_T_H_W = torch.cat(
-                [t_x_B_C_T_H_W, torch.zeros_like(padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1))],
-                dim=1,
-            )
 
         # embeddings
         x_B_T_H_W_D = rearrange(
@@ -1119,8 +996,6 @@ class WanModel_JVP(JVP):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
         t_x_B_L_D = rearrange(t_x_B_T_H_W_D, "b t h w d -> b (t h w) d")
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
-        seq_len = seq_lens.max().item()
-        assert seq_lens.max() == seq_len
 
         def time_embed_fn(t):
             e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
@@ -1158,8 +1033,6 @@ class WanModel_JVP(JVP):
         )
 
         for block_idx, block in enumerate(self.blocks):
-            if slg_layers is not None and block_idx in slg_layers and is_uncond:
-                continue
             x_B_L_D_withT = block(x_B_L_D_withT, **kwargs, withT=True)
 
         # head
@@ -1236,13 +1109,13 @@ class WanModel_JVP(JVP):
         if self.head.head.bias is not None:
             nn.init.zeros_(self.head.head.bias)
 
-    def fully_shard(self, mesh):
+    def fully_shard(self, mesh, mp_policy):
         for i, block in enumerate(self.blocks):
-            fully_shard(block, mesh=mesh, reshard_after_forward=True)
-        fully_shard(self.head, mesh=mesh, reshard_after_forward=False)
-        fully_shard(self.text_embedding, mesh=mesh, reshard_after_forward=True)
-        # fully_shard(self.time_embedding, mesh=mesh, reshard_after_forward=True)
-        # fully_shard(self.patch_embedding, mesh=mesh, reshard_after_forward=True)
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
+        fully_shard(self.head, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=False)
+        fully_shard(self.text_embedding, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
+        # fully_shard(self.time_embedding, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
+        # fully_shard(self.patch_embedding, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
 
     def disable_context_parallel(self):
         # pos_embedder
@@ -1262,11 +1135,7 @@ class WanModel_JVP(JVP):
         self.rope_position_embedding.enable_context_parallel(process_group=process_group)
         cp_ranks = get_process_group_ranks(process_group)
         for block in self.blocks:
-            block.self_attn.set_context_parallel_group(
-                process_group=process_group,
-                ranks=cp_ranks,
-                stream=torch.cuda.Stream(),
-            )
+            block.self_attn.set_context_parallel_group(process_group=process_group, ranks=cp_ranks, stream=torch.cuda.Stream())
 
         self._is_context_parallel_enabled = True
 
@@ -1283,19 +1152,8 @@ class WanModel_JVP(JVP):
         for block_id, block in self.blocks.named_children():
             if int(block_id) % sac_config.every_n_blocks == 0:
                 log.info(f"Enable selective checkpoint for block {block_id}")
-                block = ptd_checkpoint_wrapper(
-                    block,
-                    context_fn=_context_fn,
-                    preserve_rng_state=False,
-                )
+                block = ptd_checkpoint_wrapper(block, context_fn=_context_fn, preserve_rng_state=False)
                 self.blocks.register_module(block_id, block)
-        self.register_module(
-            "head",
-            ptd_checkpoint_wrapper(
-                self.head,
-                context_fn=_context_fn,
-                preserve_rng_state=False,
-            ),
-        )
+        self.register_module("head", ptd_checkpoint_wrapper(self.head, context_fn=_context_fn, preserve_rng_state=False))
 
         return self

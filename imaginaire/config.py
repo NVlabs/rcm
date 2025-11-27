@@ -188,6 +188,8 @@ class JobConfig:
     group: str = ""
     # Run/job name.
     name: str = ""
+    # W&B mode, can be "online", or "disabled".
+    wandb_mode: str = "online"
 
     @property
     def path(self) -> str:
@@ -263,8 +265,12 @@ class CheckpointConfig:
     type: dict | None = None
     # for dcp, whether to use async mode
     dcp_async_mode_enabled: bool = False
+    # Configs for saving the checkpoints to object store.
+    save_to_object_store: ObjectStoreConfig = attrs.field(factory=ObjectStoreConfig)
     # Save the checkpoint every N iterations.
     save_iter: int = 999999999
+    # Configs for loading the checkpoints from object store.
+    load_from_object_store: ObjectStoreConfig = attrs.field(factory=ObjectStoreConfig)
     # Path of model weights to resume the checkpoint from.
     load_path: str = ""
     # Whether to load the training states (optimizer/scheduler/grad-scaler) from the checkpoint path.
@@ -278,7 +284,7 @@ class CheckpointConfig:
     # Print detailed information during checkpoint saving/loading.
     verbose: bool = True
     # keys not to resume from the checkpoint, choices: ["model", "optim", "scheduler", "trainer"]
-    keys_not_to_resume: list[str] = []  # noqa: RUF008
+    keys_not_to_resume: list[str] = []
     # Whether to use the local filesystem for broadcasting checkpoint data (used for Tensor Parallel Checkpointer).
     broadcast_via_filesystem: bool = False
     load_ema_to_reg: bool = False

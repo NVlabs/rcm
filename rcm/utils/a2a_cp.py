@@ -151,10 +151,7 @@ class DistributedAttention(torch.nn.Module):
         sequence_process_group (ProcessGroup): sequence parallel process group
     """
 
-    def __init__(
-        self,
-        local_attention: Union[Module, Callable],
-    ) -> None:
+    def __init__(self, local_attention: Union[Module, Callable]) -> None:
         super(DistributedAttention, self).__init__()
         self.local_attn = local_attention
         self.pg = None

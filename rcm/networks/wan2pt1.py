@@ -32,7 +32,6 @@ except ImportError:
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
-from torchvision import transforms
 
 from imaginaire.utils import log
 from rcm.utils.a2a_cp import MinimalA2AAttnOp
@@ -139,7 +138,6 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
 
         Args:
             B_T_H_W_C (torch.Size): Input tensor size (Batch, Time, Height, Width, Channels).
-            fps (Optional[torch.Tensor], optional): Frames per second. Defaults to None.
             h_ntk_factor (Optional[float], optional): Height NTK factor. If None, uses self.h_ntk_factor.
             w_ntk_factor (Optional[float], optional): Width NTK factor. If None, uses self.w_ntk_factor.
             t_ntk_factor (Optional[float], optional): Time NTK factor. If None, uses self.t_ntk_factor.
@@ -265,17 +263,15 @@ class WanLayerNorm(nn.LayerNorm):
 
 
 class WanSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, cp_comm_type="p2p"):
+    def __init__(self, dim, num_heads, qk_norm=True, eps=1e-6):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
         self.qk_norm = qk_norm
-        self.cp_comm_type = cp_comm_type
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -321,7 +317,7 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = self.attn_op(rope_apply(q, video_size, freqs), rope_apply(k, video_size, freqs), v, video_size)
+        x = self.attn_op(rope_apply(q, video_size, freqs), rope_apply(k, video_size, freqs), v)
 
         # output
         x = x.flatten(2)
@@ -348,7 +344,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = self.attn_op(q, k, v, None)
+        x = self.attn_op(q, k, v)
         # output
         x = x.flatten(2)
         x = self.o(x)
@@ -356,8 +352,8 @@ class WanT2VCrossAttention(WanSelfAttention):
 
 
 class WanI2VCrossAttention(WanSelfAttention):
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, cp_comm_type="p2p"):
-        super().__init__(dim, num_heads, window_size, qk_norm, eps, cp_comm_type)
+    def __init__(self, dim, num_heads, qk_norm=True, eps=1e-6):
+        super().__init__(dim, num_heads, qk_norm, eps)
 
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
@@ -407,39 +403,24 @@ class WanI2VCrossAttention(WanSelfAttention):
         return x
 
 
-WAN_CROSSATTENTION_CLASSES = {
-    "t2v_cross_attn": WanT2VCrossAttention,
-    "i2v_cross_attn": WanI2VCrossAttention,
-}
+WAN_CROSSATTENTION_CLASSES = {"t2v_cross_attn": WanT2VCrossAttention, "i2v_cross_attn": WanI2VCrossAttention}
 
 
 class WanAttentionBlock(nn.Module):
-    def __init__(
-        self,
-        cross_attn_type,
-        dim,
-        ffn_dim,
-        num_heads,
-        window_size=(-1, -1),
-        qk_norm=True,
-        cross_attn_norm=False,
-        eps=1e-6,
-        cp_comm_type="p2p",
-    ):
+    def __init__(self, cross_attn_type, dim, ffn_dim, num_heads, qk_norm=True, cross_attn_norm=False, eps=1e-6):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
         self.num_heads = num_heads
-        self.window_size = window_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps, cp_comm_type)
+        self.self_attn = WanSelfAttention(dim, num_heads, qk_norm, eps)
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps, cp_comm_type)
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, qk_norm, eps)
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
 
@@ -457,16 +438,7 @@ class WanAttentionBlock(nn.Module):
         std = 1.0 / math.sqrt(self.dim)
         torch.nn.init.trunc_normal_(self.modulation, std=std)
 
-    def forward(
-        self,
-        x,
-        e,
-        seq_lens,
-        video_size: VideoSize,
-        freqs,
-        context,
-        context_lens,
-    ):
+    def forward(self, x, e, seq_lens, video_size: VideoSize, freqs, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
@@ -483,7 +455,6 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, video_size, freqs)
         with amp.autocast("cuda", dtype=torch.float32):
-            # TODO: (qsh 2025-05-07) type_as
             x = x + y * e[2].type_as(x)
 
         # cross-attention & ffn function
@@ -491,7 +462,6 @@ class WanAttentionBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
             with amp.autocast("cuda", dtype=torch.float32):
-                # TODO: (qsh 2025-05-07) type_as
                 x = x + y * e[5].type_as(x)
             return x
 
@@ -586,15 +556,10 @@ class WanModel(nn.Module):
         out_dim=16,
         num_heads=16,
         num_layers=32,
-        window_size=(-1, -1),
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
-        concat_padding_mask: bool = False,
         sac_config: SACConfig = SACConfig(),
-        n_dense_blocks: int = -1,
-        gna_parameters: dict = None,
-        cp_comm_type: str = "p2p",
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -622,30 +587,12 @@ class WanModel(nn.Module):
                 Number of attention heads
             num_layers (`int`, *optional*, defaults to 32):
                 Number of transformer blocks
-            window_size (`tuple`, *optional*, defaults to (-1, -1)):
-                Window size for local attention (-1 indicates global attention)
             qk_norm (`bool`, *optional*, defaults to True):
                 Enable query/key normalization
             cross_attn_norm (`bool`, *optional*, defaults to False):
                 Enable cross-attention normalization
             eps (`float`, *optional*, defaults to 1e-6):
                 Epsilon value for normalization layers
-            concat_padding_mask (`bool`, *optional*, defaults to False):
-                Enable concat padding mask
-            n_dense_blocks (`int`, *optional*, defaults to -1):
-                Number of blocks that will remain dense (not replaced with sparse attention)
-                If -1, no blocks are replaced with sparse attention
-                If 0, all blocks use sparse attention
-                Otherwise, n_dense_blocks blocks will remain dense, distributed evenly across the network
-            gna_parameters (`dict`, *optional*, defaults to None):
-                Sparse attention parameters. Only required when n_dense_blocks > -1.
-                Should include at least two key, value pairs:
-                  - window_size: `tuple` of size 3 indicating neighborhood attention window size.
-                    window size of -1 along any dimension means self attention.
-                  - stride: `int`, or `tuple` of size 3 indicating generalized neighborhood
-                    attention (GNA) stride.
-            cp_comm_type (str, *optional*, defaults to 'p2p'):
-                CP communication type passed to TE.
         """
 
         super().__init__()
@@ -663,16 +610,12 @@ class WanModel(nn.Module):
         self.out_dim = out_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.window_size = window_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
-        self.concat_padding_mask = concat_padding_mask
-        self.cp_comm_type = cp_comm_type
         self.use_crossattn_projection = False
 
         # embeddings
-        in_dim = in_dim + 1 if self.concat_padding_mask else in_dim
         self.patch_embedding = nn.Linear(in_dim * patch_size[0] * patch_size[1] * patch_size[2], dim)
 
         self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
@@ -683,20 +626,7 @@ class WanModel(nn.Module):
         # blocks
         cross_attn_type = "t2v_cross_attn" if model_type == "t2v" else "i2v_cross_attn"
         self.blocks = nn.ModuleList(
-            [
-                WanAttentionBlock(
-                    cross_attn_type,
-                    dim,
-                    ffn_dim,
-                    num_heads,
-                    window_size,
-                    qk_norm,
-                    cross_attn_norm,
-                    eps,
-                    self.cp_comm_type,
-                )
-                for _ in range(num_layers)
-            ]
+            [WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads, qk_norm, cross_attn_norm, eps) for _ in range(num_layers)]
         )
 
         # head
@@ -707,12 +637,7 @@ class WanModel(nn.Module):
 
         d = dim // num_heads
 
-        self.rope_position_embedding = VideoRopePosition3DEmb(
-            head_dim=d,
-            len_h=128,
-            len_w=128,
-            len_t=32,
-        )
+        self.rope_position_embedding = VideoRopePosition3DEmb(head_dim=d, len_h=128, len_w=128, len_t=32)
 
         if model_type == "i2v" or model_type == "flf2v":
             self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == "flf2v")
@@ -720,11 +645,6 @@ class WanModel(nn.Module):
         # initialize weights
         self.init_weights()
 
-        # Replace self-attention with sparse attention if specified
-        if n_dense_blocks != -1:
-            self = replace_selfattn_op_with_sparse_attn_op(self, n_dense_blocks, gna_parameters=gna_parameters)
-
-        # TODO: (qsh 2025-05-10) remove this, this is not good! should be done outside!
         self.enable_selective_checkpoint(sac_config)
 
     def forward(
@@ -732,12 +652,8 @@ class WanModel(nn.Module):
         x_B_C_T_H_W,
         timesteps_B_T,
         crossattn_emb,
-        seq_len=None,
         frame_cond_crossattn_emb_B_L_D=None,
         y_B_C_T_H_W=None,
-        padding_mask: Optional[torch.Tensor] = None,
-        is_uncond=False,
-        slg_layers=None,
         **kwargs,
     ):
         r"""
@@ -750,8 +666,6 @@ class WanModel(nn.Module):
                 Diffusion timesteps tensor of shape [B]
             context (List[Tensor]):
                 List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
             frame_cond_crossattn_emb_B_L_D (Tensor, *optional*):
                 CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y_B_C_T_H_W (Tensor, *optional*):
@@ -771,12 +685,6 @@ class WanModel(nn.Module):
         if y_B_C_T_H_W is not None:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, y_B_C_T_H_W], dim=1)
 
-        if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
-            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1)
-
         # embeddings
         x_B_T_H_W_D = rearrange(
             x_B_C_T_H_W,
@@ -791,8 +699,6 @@ class WanModel(nn.Module):
         video_size = VideoSize(T=x_B_T_H_W_D.shape[1], H=x_B_T_H_W_D.shape[2], W=x_B_T_H_W_D.shape[3])
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
-        seq_len = seq_lens.max().item()
-        assert seq_lens.max() == seq_len
 
         # time embeddings
         with amp.autocast("cuda", dtype=torch.float32):
@@ -819,8 +725,6 @@ class WanModel(nn.Module):
         )
 
         for block_idx, block in enumerate(self.blocks):
-            if slg_layers is not None and block_idx in slg_layers and is_uncond:
-                continue
             x_B_L_D = block(x_B_L_D, **kwargs)
 
         # head
@@ -884,13 +788,13 @@ class WanModel(nn.Module):
         if self.head.head.bias is not None:
             nn.init.zeros_(self.head.head.bias)
 
-    def fully_shard(self, mesh):
+    def fully_shard(self, mesh, mp_policy):
         for i, block in enumerate(self.blocks):
-            fully_shard(block, mesh=mesh, reshard_after_forward=True)
-        fully_shard(self.head, mesh=mesh, reshard_after_forward=False)
-        fully_shard(self.text_embedding, mesh=mesh, reshard_after_forward=True)
-        fully_shard(self.time_embedding, mesh=mesh, reshard_after_forward=True)
-        fully_shard(self.patch_embedding, mesh=mesh, reshard_after_forward=True)
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
+        fully_shard(self.head, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=False)
+        fully_shard(self.text_embedding, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
+        fully_shard(self.time_embedding, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
+        fully_shard(self.patch_embedding, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
 
     def disable_context_parallel(self):
         # pos_embedder
@@ -910,11 +814,7 @@ class WanModel(nn.Module):
         self.rope_position_embedding.enable_context_parallel(process_group=process_group)
         cp_ranks = get_process_group_ranks(process_group)
         for block in self.blocks:
-            block.self_attn.set_context_parallel_group(
-                process_group=process_group,
-                ranks=cp_ranks,
-                stream=torch.cuda.Stream(),
-            )
+            block.self_attn.set_context_parallel_group(process_group=process_group, ranks=cp_ranks, stream=torch.cuda.Stream())
 
         self._is_context_parallel_enabled = True
 
@@ -931,19 +831,8 @@ class WanModel(nn.Module):
         for block_id, block in self.blocks.named_children():
             if int(block_id) % sac_config.every_n_blocks == 0:
                 log.info(f"Enable selective checkpoint for block {block_id}")
-                block = ptd_checkpoint_wrapper(
-                    block,
-                    context_fn=_context_fn,
-                    preserve_rng_state=False,
-                )
+                block = ptd_checkpoint_wrapper(block, context_fn=_context_fn, preserve_rng_state=False)
                 self.blocks.register_module(block_id, block)
-        self.register_module(
-            "head",
-            ptd_checkpoint_wrapper(
-                self.head,
-                context_fn=_context_fn,
-                preserve_rng_state=False,
-            ),
-        )
+        self.register_module("head", ptd_checkpoint_wrapper(self.head, context_fn=_context_fn, preserve_rng_state=False))
 
         return self

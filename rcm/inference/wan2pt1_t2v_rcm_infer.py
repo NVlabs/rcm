@@ -18,6 +18,7 @@ import math
 
 import torch
 from einops import rearrange, repeat
+from tqdm import tqdm
 
 from imaginaire.utils.io import save_image_or_video
 from imaginaire.lazy_config import LazyCall as L, LazyDict, instantiate
@@ -119,8 +120,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--num_steps", type=int, choices=[1, 2, 3, 4], default=4, help="1~4 for timestep-distilled inference")
     parser.add_argument("--sigma_max", type=float, default=80, help="Initial sigma for rCM")
     parser.add_argument("--dit_path", type=str, default="", help="Custom path to the DiT model checkpoint for distilled models.")
-    parser.add_argument("--vae_path", type=str, default="checkpoints/Wan2.1_VAE.pth", help="Path to the Wan2.1 VAE.")
-    parser.add_argument("--text_encoder_path", type=str, default="checkpoints/models_t5_umt5-xxl-enc-bf16.pth", help="Path to the umT5 text encoder.")
+    parser.add_argument("--vae_path", type=str, default="assets/checkpoints/Wan2.1_VAE.pth", help="Path to the Wan2.1 VAE.")
+    parser.add_argument("--text_encoder_path", type=str, default="assets/checkpoints/models_t5_umt5-xxl-enc-bf16.pth", help="Path to the umT5 text encoder.")
     parser.add_argument("--num_frames", type=int, default=77, help="Number of frames to generate")
     parser.add_argument("--prompt", type=str, default=_DEFAULT_PROMPT, help="Text prompt for video generation")
     parser.add_argument("--resolution", default="480p", type=str, help="Resolution of the generated output")
@@ -198,10 +199,10 @@ if __name__ == "__main__":
     # Sampling steps
     x = init_noise.to(torch.float64)
     ones = torch.ones(x.size(0), device=x.device, dtype=x.dtype)
-    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+    total_steps = t_steps.shape[0] - 1
+    for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
         with torch.no_grad():
             x = denoise(net, x.float(), t_cur.float() * ones, condition=condition).to(torch.float64)
-        if t_next > 1e-5:
             x = torch.cos(t_next) * x + torch.sin(t_next) * torch.randn(
                 *x.shape,
                 dtype=torch.float32,

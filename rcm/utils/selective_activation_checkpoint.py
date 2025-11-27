@@ -19,7 +19,7 @@ from enum import Enum
 import torch
 
 try:
-    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts, noop_context_fn
 except ImportError:
     CheckpointPolicy = None
 
@@ -68,6 +68,6 @@ class SACConfig:
         if self.mode == CheckpointMode.MM_ONLY:
             return mm_only_context_fn
         elif self.mode == CheckpointMode.BLOCK_WISE:
-            return None
+            return noop_context_fn
         else:
             raise ValueError(f"Invalid mode: {self.mode}")

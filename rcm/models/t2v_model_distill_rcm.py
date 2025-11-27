@@ -19,7 +19,7 @@ import collections
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Literal
 
 import attrs
 import numpy as np
@@ -29,37 +29,40 @@ import torch.distributed.checkpoint as dcp
 from einops import rearrange, repeat
 from megatron.core import parallel_state
 from torch import Tensor
-from torch.distributed._composable.fsdp import FSDPModule, fully_shard
+from torch.distributed._composable.fsdp import FSDPModule, fully_shard, MixedPrecisionPolicy
 from torch.distributed._tensor.api import DTensor
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
 from torch.nn.modules.module import _IncompatibleKeys
+from imaginaire.config import ObjectStoreConfig
+from imaginaire.lazy_config import LazyCall as L
+from imaginaire.lazy_config import LazyDict
+from imaginaire.lazy_config import instantiate as lazy_instantiate
+from imaginaire.model import ImaginaireModel
+from imaginaire.utils import log, misc
+from imaginaire.utils.easy_io import easy_io
+from imaginaire.utils.ema import FastEmaModelUpdater
+from imaginaire.callbacks.low_precision import update_master_weights
+from rcm.conditioner import DataType, TextCondition, concat_condition
+from rcm.utils.optim_instantiate_dtensor import get_base_scheduler
+from rcm.utils.lognormal import LogNormal
+from rcm.utils.checkpointer import non_strict_load_model
+from rcm.utils.context_parallel import broadcast, broadcast_split_tensor, cat_outputs_cp
+from rcm.utils.dtensor_helper import DTensorFastEmaModelUpdater, broadcast_dtensor_model_states
+from rcm.utils.fsdp_helper import hsdp_device_mesh
+from rcm.utils.jvp_helper import TensorWithT
+from rcm.utils.misc import count_params
+from rcm.utils.torch_future import clip_grad_norm_
+from rcm.modules.denoiser_scaling import RectifiedFlow_TrigFlowWrapper
+from rcm.configs.defaults.ema import EMAConfig
+from rcm.samplers.euler import FlowEulerSampler
+from rcm.samplers.unipc import FlowUniPCMultistepSampler
 
 torch._dynamo.config.suppress_errors = True
 
 IS_PREPROCESSED_KEY = "is_preprocessed"
-
-
-def update_master_weights(optimizer: torch.optim.Optimizer):
-    if getattr(optimizer, "master_weights", False) and optimizer.param_groups_master is not None:
-        params, master_params = [], []
-        for group, group_master in zip(optimizer.param_groups, optimizer.param_groups_master):
-            for p, p_master in zip(group["params"], group_master["params"]):
-                params.append(get_local_tensor_if_DTensor(p.data))
-                master_params.append(p_master.data)
-        torch._foreach_copy_(params, master_params)
-
-
-def concat_condition(cond1, cond2):
-    kwargs1, kwargs2 = cond1.to_dict(skip_underscore=False), cond2.to_dict(skip_underscore=False)
-    kwargs = {}
-    for key, value in kwargs1.items():
-        if value is not None and isinstance(value, torch.Tensor):
-            kwargs[key] = torch.cat([value, kwargs2[key]], dim=0)
-        else:
-            kwargs[key] = value
-    return type(cond1)(**kwargs)
+IS_PROCESSED_KEY = "is_processed"
 
 
 @dataclass
@@ -69,49 +72,37 @@ class DenoisePrediction:
 
 
 @attrs.define(slots=False)
-class T2VDistillConfig:
+class T2VDistillConfig_rCM:
 
     tokenizer: LazyDict = None
     conditioner: LazyDict = None
     net: LazyDict = None
     net_teacher: LazyDict = None
     net_fake_score: LazyDict = None
-    optimizer_fake_score_config: LazyDict = L(get_base_optimizer)(
-        model=None,
-        lr=1e-6,
-        weight_decay=0.1,
-        betas=[0, 0.999],
-        optim_type="fusedadam",
-        eps=1e-8,
-        master_weights=True,
-        capturable=True,
-    )
+    optimizer_fake_score: LazyDict = None
     teacher_ckpt: str = ""
-    tangent_warmup: int = 1000
+    tangent_warmup: int = 1
     teacher_guidance: float = 5.0
     grad_clip: bool = False
+    sigma_max: float = 80
 
     ema: EMAConfig = EMAConfig()
     checkpoint: ObjectStoreConfig = ObjectStoreConfig()
-    sde: LazyDict = L(EDMSDE)(
+    p_G: LazyDict = L(LogNormal)(
         p_mean=-0.8,
         p_std=1.6,
-        sigma_max=80,
-        sigma_min=0.0002,
     )
-    sde_D: LazyDict = L(EDMSDE)(
+    p_D: LazyDict = L(LogNormal)(
         p_mean=0.0,
         p_std=1.6,
-        sigma_max=80,
-        sigma_min=0.0002,
     )
     student_update_freq: int = 5
     fsdp_shard_size: int = 1
     sigma_data: float = 1.0
     precision: str = "bfloat16"
-    input_data_key: str = "video"  # key to fetch input data from data_batch
-    input_image_key: str = "images"  # key to fetch input image from data_batch
-    input_caption_key: str = "ai_caption"
+    input_data_key: str = "videos"
+    input_latent_key: str = "latents"
+    input_caption_key: str = "prompts"
     loss_scale: float = 100.0
     loss_scale_dmd: float = 1.0
     loss_scale_fake_score: float = 1.0
@@ -124,22 +115,17 @@ class T2VDistillConfig:
     adjust_video_noise: bool = True  # whether or not adjust video noise accroding to the video length
 
     state_ch: int = 16
-    state_t: int = 8
+    state_t: int = 21  # Number of latent frames
     resolution: str = "480p"
     rectified_flow_t_scaling_factor: float = 1000.0
-    resize_online: bool = (
-        False  # whether or not resize the video online; usecase: we load a long duration video and resize to fewer frames, simulate low fps video. If true, it use tokenizer and state_t to infer the expected length of the resized video.
-    )
 
     text_encoder_class: str = "umT5"
+    text_encoder_path: str = ""
 
 
-class DiffusionModel(ImaginaireModel):
-    """
-    Diffusion model.
-    """
+class T2VDistillModel_rCM(ImaginaireModel):
 
-    def __init__(self, config: T2VDistillConfig):
+    def __init__(self, config: T2VDistillConfig_rCM):
         super().__init__()
 
         self.config = config
@@ -157,13 +143,14 @@ class DiffusionModel(ImaginaireModel):
         self.setup_data_key()
 
         # 2. setup up diffusion processing and scaling~(pre-condition), sampler
-        self.sde = lazy_instantiate(config.sde)
-        self.sde_D = lazy_instantiate(config.sde_D)
+        self.p_G = lazy_instantiate(config.p_G)
+        self.p_D = lazy_instantiate(config.p_D)
         self.scaling = RectifiedFlow_TrigFlowWrapper(self.sigma_data, config.rectified_flow_t_scaling_factor)
         self.grad_clip = False
         self.tangent_warmup = config.tangent_warmup
         self.teacher_guidance = config.teacher_guidance
         self.student_update_freq = config.student_update_freq
+        self.loss_scale = config.loss_scale
         self.loss_scale_dmd = config.loss_scale_dmd
         self.loss_scale_fake_score = config.loss_scale_fake_score
         self.fd_type = config.fd_type
@@ -177,7 +164,7 @@ class DiffusionModel(ImaginaireModel):
 
         # 3. tokenizer
         with misc.timer("DiffusionModel: set_up_tokenizer"):
-            self.tokenizer: BaseVAE = lazy_instantiate(config.tokenizer)
+            self.tokenizer = lazy_instantiate(config.tokenizer)
             assert self.tokenizer.latent_ch == self.config.state_ch, f"latent_ch {self.tokenizer.latent_ch} != state_shape {self.config.state_ch}"
 
         # 4. Set up loss options, including loss masking, loss reduce and loss scaling
@@ -189,9 +176,7 @@ class DiffusionModel(ImaginaireModel):
         # 5. create fsdp mesh if needed
         if config.fsdp_shard_size > 1:
             log.info(f"FSDP size: {config.fsdp_shard_size}")
-            self.fsdp_device_mesh = hsdp_device_mesh(
-                sharding_group_size=config.fsdp_shard_size,
-            )
+            self.fsdp_device_mesh = hsdp_device_mesh(sharding_group_size=config.fsdp_shard_size)
         else:
             self.fsdp_device_mesh = None
 
@@ -204,16 +189,9 @@ class DiffusionModel(ImaginaireModel):
         else:
             self.data_parallel_size = 1
 
-    def model_replicate_rank(self):
-        if self.fsdp_device_mesh:
-            rank = self.fsdp_device_mesh.get_local_rank(mesh_dim=0)
-            return rank
-        else:
-            return distributed.get_rank()
-
     def setup_data_key(self) -> None:
         self.input_data_key = self.config.input_data_key  # by default it is video key for Video diffusion model
-        self.input_image_key = self.config.input_image_key
+        self.input_latent_key = self.config.input_latent_key
         self.input_caption_key = self.config.input_caption_key
 
     def build_net(self, net_dict: LazyDict):
@@ -222,11 +200,11 @@ class DiffusionModel(ImaginaireModel):
             with torch.device(init_device):
                 net = lazy_instantiate(net_dict)
 
-            self._param_count = count_params(net, verbose=False)
-
             if self.fsdp_device_mesh:
-                net.fully_shard(mesh=self.fsdp_device_mesh)
-                net = fully_shard(net, mesh=self.fsdp_device_mesh, reshard_after_forward=True)
+                net.fully_shard(mesh=self.fsdp_device_mesh, mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.float32))
+                net = fully_shard(
+                    net, mesh=self.fsdp_device_mesh, mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.float32), reshard_after_forward=True
+                )
 
             with misc.timer("meta to cuda and broadcast model states"):
                 net.to_empty(device="cuda")
@@ -238,10 +216,8 @@ class DiffusionModel(ImaginaireModel):
                     assert isinstance(param, DTensor), f"param should be DTensor, {name} got {type(param)}"
         return net
 
-    def load_ckpt_to_net(self, net, ckpt_path, prefix="net_ema"):
+    def load_ckpt_to_net(self, net, ckpt_path, prefix="net"):
         storage_reader = FileSystemReader(ckpt_path)
-        if ckpt_path.endswith(".dcp/model"):
-            prefix = "net"
         _state_dict = get_model_state_dict(net)
 
         metadata = storage_reader.read_metadata()
@@ -320,7 +296,7 @@ class DiffusionModel(ImaginaireModel):
 
         if self.net_fake_score:
             # instantiate the optimizer and lr scheduler for fake_score
-            fake_score_optimizer = lazy_instantiate(self.config.optimizer_fake_score_config, model=self.net_fake_score)
+            fake_score_optimizer = lazy_instantiate(self.config.optimizer_fake_score, model=self.net_fake_score)
             fake_score_scheduler = get_base_scheduler(fake_score_optimizer, self, scheduler_config)
             self.optimizer_dict["fake_score"] = fake_score_optimizer
             self.scheduler_dict["fake_score"] = fake_score_scheduler
@@ -421,9 +397,9 @@ class DiffusionModel(ImaginaireModel):
         for scheduler in self.get_lr_schedulers(iteration):
             scheduler.step()
 
-    def draw_training_time(self, x0_size: int, condition: Any) -> torch.Tensor:
+    def draw_training_time_G(self, x0_size: int, condition: Any) -> torch.Tensor:
         batch_size = x0_size[0]
-        sigma_B = self.sde.sample_t(batch_size).to(device="cuda")
+        sigma_B = self.p_G(batch_size).to(device="cuda")
         sigma_B_1 = rearrange(sigma_B, "b -> b 1")  # add a dimension for T, all frames share the same sigma
         is_video_batch = condition.data_type == DataType.VIDEO
         multiplier = self.video_noise_multiplier if is_video_batch else 1
@@ -439,7 +415,7 @@ class DiffusionModel(ImaginaireModel):
             sigma_B_1 = rearrange(sigma_B, "b -> b 1")
             time_B_1 = torch.arctan(sigma_B_1 / (1 - sigma_B_1))
             return time_B_1
-        sigma_B = self.sde_D.sample_t(batch_size).to(device="cuda")
+        sigma_B = self.p_D(batch_size).to(device="cuda")
         sigma_B_1 = rearrange(sigma_B, "b -> b 1")  # add a dimension for T, all frames share the same sigma
         is_video_batch = condition.data_type == DataType.VIDEO
         multiplier = self.video_noise_multiplier if is_video_batch else 1
@@ -452,14 +428,20 @@ class DiffusionModel(ImaginaireModel):
         xt_B_C_T_H_W: torch.Tensor,
         time: torch.Tensor,
         condition: TextCondition,
-        teacher: bool,
+        net_type: Literal["teacher", "fake_score", "student"] = "teacher",
     ) -> DenoisePrediction:
         """
-        Performs denoising on the input noise data, noise level, and condition
+        Network forward to denoise the input noised data given noise level, and condition.
+
+        Assumes EDM-scaling parameterization.
+
+        Compared to base class denoise function, this function supports different net types:
+        - fake_score: the fake score net on student generator's outputs
+        - student: the student net (few-step generator)
 
         Args:
             xt (torch.Tensor): The input noise data.
-            sigma (torch.Tensor): The noise level.
+            time (torch.Tensor): The noise level under TrigFlow parameterization.
             condition (TextCondition): conditional information, generated from self.conditioner
 
         Returns:
@@ -467,52 +449,29 @@ class DiffusionModel(ImaginaireModel):
                 noise prediction (eps_pred).
         """
         if time.ndim == 1:
-            time_B_T = rearrange(time, "b -> b 1")
+            time_B_T = repeat(time, "b -> b 1")
         elif time.ndim == 2:
             time_B_T = time
         else:
-            raise ValueError(f"sigma shape {time.shape} is not supported")
+            raise ValueError(f"time shape {time.shape} is not supported")
         time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
-        # get precondition for the network
+
+        # convert noise level time to EDM-formulation coefficients
         c_skip_B_1_T_1_1, c_out_B_1_T_1_1, c_in_B_1_T_1_1, c_noise_B_1_T_1_1 = self.scaling(trigflow_t=time_B_1_T_1_1)
 
-        net = self.net_teacher if teacher else self.net
+        net = {"student": self.net, "teacher": self.net_teacher, "fake_score": self.net_fake_score}[net_type]
 
-        # forward pass through the network
         net_output_B_C_T_H_W = net(
             x_B_C_T_H_W=(xt_B_C_T_H_W * c_in_B_1_T_1_1).to(**self.tensor_kwargs),
             timesteps_B_T=c_noise_B_1_T_1_1.squeeze(dim=[1, 3, 4]).to(**self.tensor_kwargs),
             **condition.to_dict(),
         ).float()
 
+        # EDM reconstruction of x0
         x0_pred_B_C_T_H_W = c_skip_B_1_T_1_1 * xt_B_C_T_H_W + c_out_B_1_T_1_1 * net_output_B_C_T_H_W
 
         F_pred_B_C_T_H_W = (torch.cos(time_B_1_T_1_1) * xt_B_C_T_H_W - x0_pred_B_C_T_H_W) / torch.sin(time_B_1_T_1_1)
-
-        return DenoisePrediction(x0_pred_B_C_T_H_W, F_pred_B_C_T_H_W)
-
-    def denoise_fake(self, xt_B_C_T_H_W: torch.Tensor, time: torch.Tensor, condition: TextCondition) -> DenoisePrediction:
-        if time.ndim == 1:
-            time_B_T = rearrange(time, "b -> b 1")
-        elif time.ndim == 2:
-            time_B_T = time
-        else:
-            raise ValueError(f"sigma shape {time.shape} is not supported")
-        time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
-        # get precondition for the network
-        c_skip_B_1_T_1_1, c_out_B_1_T_1_1, c_in_B_1_T_1_1, c_noise_B_1_T_1_1 = self.scaling(trigflow_t=time_B_1_T_1_1)
-
-        net = self.net_fake_score
-        # forward pass through the network
-        net_output_B_C_T_H_W = net(
-            x_B_C_T_H_W=(xt_B_C_T_H_W * c_in_B_1_T_1_1).to(**self.tensor_kwargs),
-            timesteps_B_T=c_noise_B_1_T_1_1.squeeze(dim=[1, 3, 4]).to(**self.tensor_kwargs),
-            **condition.to_dict(),
-        ).float()
-
-        x0_pred_B_C_T_H_W = c_skip_B_1_T_1_1 * xt_B_C_T_H_W + c_out_B_1_T_1_1 * net_output_B_C_T_H_W
-
-        return DenoisePrediction(x0=x0_pred_B_C_T_H_W, F=net_output_B_C_T_H_W)
+        return DenoisePrediction(x0=x0_pred_B_C_T_H_W, F=F_pred_B_C_T_H_W)
 
     def student_F_withT(self, xt_B_C_T_H_W: TensorWithT, time: TensorWithT, condition: TextCondition) -> TensorWithT:
         xt_B_C_T_H_W_withT, time_withT = xt_B_C_T_H_W, time
@@ -572,7 +531,7 @@ class DiffusionModel(ImaginaireModel):
 
     def training_step_generator(self, x0_B_C_T_H_W: torch.Tensor, condition: TextCondition, uncondition: TextCondition, iteration: int):
         log.debug(f"Student update {iteration}")
-        time_B_T = self.draw_training_time(x0_B_C_T_H_W.size(), condition)
+        time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
 
         # Broadcast and split the input data and condition for model parallelism
@@ -589,9 +548,9 @@ class DiffusionModel(ImaginaireModel):
         # Generate noisy observations
         xt_B_C_T_H_W = x0_B_C_T_H_W * cost_B_1_T_1_1 + epsilon_B_C_T_H_W * sint_B_1_T_1_1
         with torch.no_grad():
-            F_teacher_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, teacher=True).F
+            F_teacher_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="teacher").F
             if self.teacher_guidance > 0.0:
-                F_teacher_B_C_T_H_W_uncond = self.denoise(xt_B_C_T_H_W, time_B_T, uncondition, teacher=True).F
+                F_teacher_B_C_T_H_W_uncond = self.denoise(xt_B_C_T_H_W, time_B_T, uncondition, net_type="teacher").F
                 F_teacher_B_C_T_H_W = F_teacher_B_C_T_H_W + self.teacher_guidance * (F_teacher_B_C_T_H_W - F_teacher_B_C_T_H_W_uncond)
 
         # see Section 5.1 JVP rearrangement discussion https://arxiv.org/pdf/2410.11081
@@ -599,17 +558,17 @@ class DiffusionModel(ImaginaireModel):
         t_time_B_T = (cost_B_1_T_1_1 * sint_B_1_T_1_1).squeeze(dim=[1, 3, 4])
 
         with torch.no_grad():
-            if self.fd_type == 1:
+            if self.fd_type == 1:  # semi-continuous
                 _, t_F_theta_B_C_T_H_W = self.student_F_withT((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_T, 0 * t_time_B_T), condition)
                 h = self.fd_size
-                F_theta_B_C_T_H_W_n1 = self.denoise(xt_B_C_T_H_W, time_B_T - h, condition, teacher=False).F
+                F_theta_B_C_T_H_W_n1 = self.denoise(xt_B_C_T_H_W, time_B_T - h, condition, net_type="student").F
                 pF_pt_B_C_T_H_W = (np.cos(h) * _ - F_theta_B_C_T_H_W_n1) / np.sin(h)
                 t_F_theta_B_C_T_H_W += cost_B_1_T_1_1 * sint_B_1_T_1_1 * pF_pt_B_C_T_H_W
-            elif self.fd_type == 2:
+            elif self.fd_type == 2:  # discrete
                 h = self.fd_size
-                _ = self.denoise(xt_B_C_T_H_W, time_B_T, condition, teacher=False).F
+                _ = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
                 xt2_B_C_T_H_W = np.cos(h) * xt_B_C_T_H_W - np.sin(h) * F_teacher_B_C_T_H_W
-                _2 = self.denoise(xt2_B_C_T_H_W, time_B_T - h, condition, teacher=False).F
+                _2 = self.denoise(xt2_B_C_T_H_W, time_B_T - h, condition, net_type="student").F
                 dF_pt_B_C_T_H_W = (np.cos(h) * _ - _2) / np.sin(h)
                 t_F_theta_B_C_T_H_W = cost_B_1_T_1_1 * sint_B_1_T_1_1 * dF_pt_B_C_T_H_W
             else:
@@ -623,7 +582,7 @@ class DiffusionModel(ImaginaireModel):
             num_simulation_steps_fake = self.get_effective_iteration(iteration) % self.max_simulation_steps_fake
             for _ in range(num_simulation_steps_fake):
                 with torch.no_grad():
-                    G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, teacher=False).x0
+                    G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
                 G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
                 G_time_B_T = self.sync(G_time_B_T, condition)
                 G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
@@ -632,11 +591,11 @@ class DiffusionModel(ImaginaireModel):
             all_xt_B_C_T_H_W = torch.cat([xt_B_C_T_H_W, G_xt_B_C_T_H_W], dim=0)
             all_time_B_T = torch.cat([time_B_T, G_time_B_T], dim=0)
             all_condition = concat_condition(condition, condition)
-            all_theta_B_C_T_H_W = self.denoise(all_xt_B_C_T_H_W, all_time_B_T, all_condition, teacher=False)
+            all_theta_B_C_T_H_W = self.denoise(all_xt_B_C_T_H_W, all_time_B_T, all_condition, net_type="student")
             F_theta_B_C_T_H_W, _ = torch.chunk(all_theta_B_C_T_H_W.F, 2)
             _, G_x0_theta_B_C_T_H_W = torch.chunk(all_theta_B_C_T_H_W.x0, 2)
         else:
-            F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, teacher=False).F
+            F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
         F_theta_B_C_T_H_W_sg = F_theta_B_C_T_H_W.clone().detach()
 
         warmup_ratio = min(1.0, iteration / self.tangent_warmup)
@@ -688,12 +647,12 @@ class DiffusionModel(ImaginaireModel):
             D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * torch.cos(D_time_B_1_T_1_1) + torch.randn_like(x0_B_C_T_H_W) * torch.sin(D_time_B_1_T_1_1)
 
             with torch.no_grad():
-                x0_theta_fake_B_C_T_H_W = self.denoise_fake(D_xt_theta_B_C_T_H_W, D_time_B_T, condition).x0
+                x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
 
             with torch.no_grad():
-                x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, teacher=True).x0
+                x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="teacher").x0
                 if self.teacher_guidance > 0.0:
-                    x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, teacher=True).x0
+                    x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, net_type="teacher").x0
                     x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W + self.teacher_guidance * (
                         x0_theta_teacher_B_C_T_H_W - x0_theta_teacher_B_C_T_H_W_uncond
                     )
@@ -715,7 +674,7 @@ class DiffusionModel(ImaginaireModel):
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         log.debug(f"Critic update {iteration}")
         # Sample pertubation noise levels and N(0, 1) noises
-        time_B_T = self.draw_training_time(x0_B_C_T_H_W.size(), condition)
+        time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
 
         # Broadcast and split the input data and condition for model parallelism
@@ -734,7 +693,7 @@ class DiffusionModel(ImaginaireModel):
         num_simulation_steps_fake = self.get_effective_iteration_fake(iteration) % self.max_simulation_steps_fake
         for _ in range(num_simulation_steps_fake):
             with torch.no_grad():
-                G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, teacher=False).x0
+                G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
             G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
             G_time_B_T = self.sync(G_time_B_T, condition)
             G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
@@ -742,7 +701,7 @@ class DiffusionModel(ImaginaireModel):
             G_xt_B_C_T_H_W = G_x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
 
         with torch.no_grad():
-            G_x0_theta_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, teacher=False).x0
+            G_x0_theta_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
 
         D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
         D_epsilon_B_C_T_H_W = torch.randn_like(x0_B_C_T_H_W)
@@ -750,7 +709,7 @@ class DiffusionModel(ImaginaireModel):
         D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
         D_cost_B_1_T_1_1, D_sint_B_1_T_1_1 = torch.cos(D_time_B_1_T_1_1), torch.sin(D_time_B_1_T_1_1)
         D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * D_cost_B_1_T_1_1 + D_epsilon_B_C_T_H_W * D_sint_B_1_T_1_1
-        x0_theta_fake_B_C_T_H_W = self.denoise_fake(D_xt_theta_B_C_T_H_W, D_time_B_T, condition).x0
+        x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
         kendall_loss = self.loss_scale_fake_score * ((G_x0_theta_B_C_T_H_W - x0_theta_fake_B_C_T_H_W) ** 2 / D_sint_B_1_T_1_1**2).sum(
             dim=(1, 2, 3, 4)
         )
@@ -762,11 +721,6 @@ class DiffusionModel(ImaginaireModel):
         return output_batch, kendall_loss
 
     def training_step(self, data_batch: dict[str, torch.Tensor], iteration: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        self._update_train_stats(data_batch)
-        if data_batch.get("t5_text_embeddings", None) is None:
-            log.error(str(data_batch))
-            assert False
-
         # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
         _, x0_B_C_T_H_W, condition, uncondition = self.get_data_and_condition(data_batch)
 
@@ -808,13 +762,10 @@ class DiffusionModel(ImaginaireModel):
 
     # ------------------------ Sampling ------------------------
 
-    def get_x0_fn_from_batch(
-        self,
-        data_batch: Dict,
-    ) -> Callable:
+    def get_x0_fn_from_batch(self, data_batch: Dict) -> Callable:
 
-        _, x0, condition, uncondition = self.get_data_and_condition(data_batch)
-        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, uncondition, None, None)
+        _, _, condition, uncondition = self.get_data_and_condition(data_batch)
+        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(None, condition, uncondition, None, None)
 
         # For inference, check if parallel_state is initialized
         if not parallel_state.is_initialized():
@@ -822,13 +773,7 @@ class DiffusionModel(ImaginaireModel):
 
         @torch.no_grad()
         def x0_fn(noise_x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
-            raw_x0 = self.denoise(noise_x, time, condition, teacher=False).x0
-            if "guided_image" in data_batch:
-                # replacement trick that enables inpainting with base model
-                assert "guided_mask" in data_batch, "guided_mask should be in data_batch if guided_image is present"
-                guide_image = data_batch["guided_image"]
-                guide_mask = data_batch["guided_mask"]
-                raw_x0 = guide_mask * guide_image + (1 - guide_mask) * raw_x0
+            raw_x0 = self.denoise(noise_x, time, condition, net_type="student").x0
             return raw_x0
 
         return x0_fn
@@ -844,10 +789,7 @@ class DiffusionModel(ImaginaireModel):
         init_noise: torch.Tensor = None,
         mid_t: List[float] | None = None,
     ) -> torch.Tensor:
-        self._normalize_video_databatch_inplace(data_batch)
-        self._augment_image_dim_inplace(data_batch)
-        is_image_batch = self.is_image_batch(data_batch)
-        input_key = self.input_image_key if is_image_batch else self.input_data_key
+        input_key = self.input_data_key
 
         if n_sample is None:
             n_sample = data_batch[input_key].shape[0]
@@ -881,7 +823,7 @@ class DiffusionModel(ImaginaireModel):
             mid_t = [1.3, 1.0, 0.6][: num_steps - 1]
 
         t_steps = torch.tensor(
-            [math.atan(self.sde.sigma_max)] + list(mid_t),
+            [math.atan(self.config.sigma_max)] + list(mid_t),
             dtype=torch.float64,
             device=init_noise.device,
         )
@@ -903,11 +845,95 @@ class DiffusionModel(ImaginaireModel):
             )
             if self.net.is_context_parallel_enabled:
                 noise = broadcast_split_tensor(noise, seq_dim=2, process_group=self.get_context_parallel_group())
-            if t_next > 1e-5:
-                x = torch.cos(t_next) * x + torch.sin(t_next) * noise
+            x = torch.cos(t_next) * x + torch.sin(t_next) * noise
         samples = x.float()
         if self.net.is_context_parallel_enabled:
             samples = cat_outputs_cp(samples, seq_dim=2, cp_group=self.get_context_parallel_group())
+        return torch.nan_to_num(samples)
+
+    @torch.no_grad()
+    def generate_samples_from_batch_teacher(
+        self,
+        data_batch: Dict,
+        seed: int = 1,
+        state_shape: Tuple | None = None,
+        n_sample: int | None = None,
+        init_noise: torch.Tensor = None,
+        num_steps: int = 50,
+        sampler="UniPC",
+        timestep_shift=5.0,
+    ) -> torch.Tensor:
+        """
+        Generate samples from the batch. Based on given batch, it will automatically determine whether to generate image or video samples.
+        Args:
+            data_batch (dict): raw data batch draw from the training data loader.
+            iteration (int): Current iteration number.
+            guidance (float): guidance weights
+            seed (int): random seed
+            state_shape (tuple): shape of the state, default to data batch if not provided
+            n_sample (int): number of samples to generate
+            num_steps (int): number of steps for the diffusion process
+        """
+        _, _, condition, uncondition = self.get_data_and_condition(data_batch)
+        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(None, condition, uncondition, None, None)
+
+        input_key = self.input_data_key
+
+        if n_sample is None:
+            n_sample = data_batch[input_key].shape[0]
+        if state_shape is None:
+            _T, _H, _W = data_batch[input_key].shape[-3:]
+            state_shape = [
+                self.config.state_ch,
+                self.tokenizer.get_latent_num_frames(_T),
+                _H // self.tokenizer.spatial_compression_factor,
+                _W // self.tokenizer.spatial_compression_factor,
+            ]
+
+        generator = torch.Generator(device=self.tensor_kwargs["device"])
+        generator.manual_seed(seed)
+
+        if init_noise is None:
+            init_noise = torch.randn(
+                n_sample,
+                *state_shape,
+                dtype=torch.float32,
+                device=self.tensor_kwargs["device"],
+                generator=generator,
+            )
+
+        if self.net_teacher.is_context_parallel_enabled:
+            init_noise = broadcast_split_tensor(init_noise, seq_dim=2, process_group=self.get_context_parallel_group())
+
+        x = init_noise.to(torch.float64)
+
+        sigma_max = self.config.sigma_max / (self.config.sigma_max + 1)
+        unshifted_sigma_max = sigma_max / (timestep_shift - (timestep_shift - 1) * sigma_max)
+
+        samplers = {"Euler": FlowEulerSampler, "UniPC": FlowUniPCMultistepSampler}
+        sampler = samplers[sampler](num_train_timesteps=1000, sigma_max=unshifted_sigma_max, sigma_min=0.0)
+        sampler.set_timesteps(num_inference_steps=num_steps, device=self.tensor_kwargs["device"], shift=timestep_shift)
+
+        ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+        for _, t in enumerate(sampler.timesteps):
+            timesteps = t * ones
+
+            with torch.no_grad():
+                v_cond = self.net_teacher(
+                    x_B_C_T_H_W=x.to(**self.tensor_kwargs), timesteps_B_T=timesteps.to(**self.tensor_kwargs), **condition.to_dict()
+                ).float()
+                v_uncond = self.net_teacher(
+                    x_B_C_T_H_W=x.to(**self.tensor_kwargs), timesteps_B_T=timesteps.to(**self.tensor_kwargs), **uncondition.to_dict()
+                ).float()
+
+            v_pred = v_uncond + self.teacher_guidance * (v_cond - v_uncond)
+
+            x = sampler.step(v_pred, t, x)
+
+        samples = x.float()
+        if self.net_teacher.is_context_parallel_enabled:
+            samples = cat_outputs_cp(samples, seq_dim=2, cp_group=self.get_context_parallel_group())
+
         return torch.nan_to_num(samples)
 
     @torch.no_grad()
@@ -966,28 +992,7 @@ class DiffusionModel(ImaginaireModel):
 
     # ------------------ Data Preprocessing ------------------
 
-    def get_data_and_condition(self, data_batch: dict[str, torch.Tensor]) -> Tuple[Tensor, TextCondition]:
-        self._normalize_video_databatch_inplace(data_batch)
-        self._augment_image_dim_inplace(data_batch)
-        is_image_batch = self.is_image_batch(data_batch)
-
-        # Latent state
-        raw_state = data_batch[self.input_image_key if is_image_batch else self.input_data_key]
-        latent_state = self.encode(raw_state).contiguous().float()
-
-        # Condition
-        if self.neg_embed is not None:
-            data_batch["neg_t5_text_embeddings"] = repeat(
-                self.neg_embed.to(**self.tensor_kwargs), "l d -> b l d", b=data_batch["t5_text_embeddings"].shape[0]
-            )
-            condition, uncondition = self.conditioner.get_condition_with_negative_prompt(data_batch)
-        else:
-            condition, uncondition = self.conditioner.get_condition_uncondition(data_batch)
-        condition = condition.edit_data_type(DataType.IMAGE if is_image_batch else DataType.VIDEO)
-        uncondition = uncondition.edit_data_type(DataType.IMAGE if is_image_batch else DataType.VIDEO)
-        return raw_state, latent_state, condition, uncondition
-
-    def _normalize_video_databatch_inplace(self, data_batch: dict[str, Tensor], input_key: str = None) -> None:
+    def _normalize_video_inplace(self, data_batch: dict[str, Tensor]) -> None:
         """
         Normalizes video data in-place on a CUDA device to reduce data loading overhead.
 
@@ -1009,40 +1014,57 @@ class DiffusionModel(ImaginaireModel):
             with moving data to/from the GPU. Ensure that the tensor is already on the appropriate device
             and has the correct dtype (torch.uint8) to avoid unexpected behaviors.
         """
-        input_key = self.input_data_key if input_key is None else input_key
+        input_key = self.input_data_key
         # only handle video batch
-        if input_key in data_batch:
-            # Check if the data has already been normalized and avoid re-normalizing
-            if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
-                assert torch.is_floating_point(data_batch[input_key]), "Video data is not in float format."
-                assert torch.all(
-                    (data_batch[input_key] >= -1.0001) & (data_batch[input_key] <= 1.0001)
-                ), f"Video data is not in the range [-1, 1]. get data range [{data_batch[input_key].min()}, {data_batch[input_key].max()}]"
-            else:
-                assert data_batch[input_key].dtype == torch.uint8, "Video data is not in uint8 format."
-                data_batch[input_key] = data_batch[input_key].to(**self.tensor_kwargs) / 127.5 - 1.0
+        # Check if the data has already been normalized and avoid re-normalizing
+        if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
+            assert torch.is_floating_point(data_batch[input_key]), "Video data is not in float format."
+            assert torch.all(
+                (data_batch[input_key] >= -1.0001) & (data_batch[input_key] <= 1.0001)
+            ), f"Video data is not in the range [-1, 1]. get data range [{data_batch[input_key].min()}, {data_batch[input_key].max()}]"
+        else:
+            assert data_batch[input_key].dtype == torch.uint8, "Video data is not in uint8 format."
+            data_batch[input_key] = data_batch[input_key].to(**self.tensor_kwargs) / 127.5 - 1.0
+            data_batch[IS_PREPROCESSED_KEY] = True
+
+        from torchvision.transforms.v2 import UniformTemporalSubsample
+
+        expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
+        original_length = data_batch[input_key].shape[2]
+        if original_length != expected_length:
+            video = rearrange(data_batch[input_key], "b c t h w -> b t c h w")
+            video = UniformTemporalSubsample(expected_length)(video)
+            data_batch[input_key] = rearrange(video, "b t c h w -> b c t h w")
+
+    def _normalize_latent_inplace(self, data_batch: dict[str, Tensor]) -> None:
+        latents = data_batch[self.input_latent_key]
+        assert latents.shape[2] >= self.config.state_t
+        data_batch[self.input_latent_key] = latents[:, :, : self.config.state_t, :, :]
+
+    def get_data_and_condition(self, data_batch: dict[str, torch.Tensor]) -> Tuple[Tensor, TextCondition]:
+        if IS_PROCESSED_KEY not in data_batch or not data_batch[IS_PROCESSED_KEY]:
+            if self.input_latent_key in data_batch:
+                self._normalize_latent_inplace(data_batch)
+                data_batch[self.input_data_key] = self.decode(data_batch[self.input_latent_key]).contiguous().float().clamp(-1, 1)
                 data_batch[IS_PREPROCESSED_KEY] = True
 
-            if self.config.resize_online:
-                from torchvision.transforms.v2 import UniformTemporalSubsample
+            self._normalize_video_inplace(data_batch)
+            data_batch[self.input_latent_key] = self.encode(data_batch[self.input_data_key]).contiguous().float()
+            data_batch[IS_PROCESSED_KEY] = True
 
-                expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
-                original_length = data_batch[input_key].shape[2]
-                if original_length != expected_length:
-                    video = rearrange(data_batch[input_key], "b c t h w -> b t c h w")
-                    video = UniformTemporalSubsample(expected_length)(video)
-                    data_batch[input_key] = rearrange(video, "b t c h w -> b c t h w")
-
-    def _augment_image_dim_inplace(self, data_batch: dict[str, Tensor], input_key: str = None) -> None:
-        input_key = self.input_image_key if input_key is None else input_key
-        if input_key in data_batch:
-            # Check if the data has already been augmented and avoid re-augmenting
-            if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
-                assert data_batch[input_key].shape[2] == 1, f"Image data is claimed be augmented while its shape is {data_batch[input_key].shape}"
-                return
-            else:
-                data_batch[input_key] = rearrange(data_batch[input_key], "b c h w -> b c 1 h w").contiguous()
-                data_batch[IS_PREPROCESSED_KEY] = True
+        raw_state = data_batch[self.input_data_key]
+        latent_state = data_batch[self.input_latent_key]
+        # Condition
+        if self.neg_embed is not None:
+            data_batch["neg_t5_text_embeddings"] = repeat(
+                self.neg_embed.to(**self.tensor_kwargs), "l d -> b l d", b=data_batch["t5_text_embeddings"].shape[0]
+            )
+            condition, uncondition = self.conditioner.get_condition_with_negative_prompt(data_batch)
+        else:
+            condition, uncondition = self.conditioner.get_condition_uncondition(data_batch)
+        condition = condition.edit_data_type(DataType.VIDEO)
+        uncondition = uncondition.edit_data_type(DataType.VIDEO)
+        return raw_state, latent_state, condition, uncondition
 
     # ------------------ Checkpointing ------------------
 
@@ -1136,13 +1158,7 @@ class DiffusionModel(ImaginaireModel):
         return {"total_learnable_param_num": self._param_count}
 
     def is_image_batch(self, data_batch: dict[str, Tensor]) -> bool:
-        """We hanlde two types of data_batch. One comes from a joint_dataloader where "dataset_name" can be used to differenciate image_batch and video_batch.
-        Another comes from a dataloader which we by default assumes as video_data for video model training.
-        """
-        is_image = self.input_image_key in data_batch
-        is_video = self.input_data_key in data_batch
-        assert is_image != is_video, "Only one of the input_image_key or input_data_key should be present in the data_batch."
-        return is_image
+        return False
 
     @torch.no_grad()
     def encode(self, state: torch.Tensor) -> torch.Tensor:
@@ -1151,6 +1167,9 @@ class DiffusionModel(ImaginaireModel):
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         return self.tokenizer.decode(latent / self.sigma_data)
+
+    def get_num_video_latent_frames(self) -> int:
+        return self.config.state_t
 
     @property
     def text_encoder_class(self) -> str:
@@ -1186,7 +1205,7 @@ class DiffusionModel(ImaginaireModel):
         foreach: Optional[bool] = None,
     ):
         if not self.grad_clip:
-            max_norm = 1e10
+            max_norm = 1e12
         if self.net_fake_score:
             for param in self.net_fake_score.parameters():
                 if param.grad is not None:
@@ -1198,6 +1217,9 @@ class DiffusionModel(ImaginaireModel):
                 error_if_nonfinite=error_if_nonfinite,
                 foreach=foreach,
             )
+        for param in self.net.parameters():
+            if param.grad is not None:
+                torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
         return clip_grad_norm_(
             self.net.parameters(),
             max_norm=max_norm,

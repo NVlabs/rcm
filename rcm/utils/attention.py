@@ -89,25 +89,20 @@ def attention(
     q,
     k,
     v,
-    q_lens=None,
-    k_lens=None,
     dropout_p=0.0,
     softmax_scale=None,
     q_scale=None,
     causal=False,
     deterministic=False,
-    dtype=torch.bfloat16,
 ):
+    assert q.dtype == k.dtype and k.dtype == v.dtype
+    dtype = q.dtype
     supported_dtypes = [torch.bfloat16, torch.float16, torch.float32]
     is_half = dtype in [torch.bfloat16, torch.float16]
     compute_cap = get_device_cc(q.device)
 
     if dtype not in supported_dtypes:
         raise NotImplementedError(f"{dtype=} is not supported.")
-
-    q = q.to(dtype)
-    k = k.to(dtype)
-    v = v.to(dtype)
 
     if q_scale is not None:
         q = q * q_scale
@@ -147,9 +142,7 @@ def attention(
             BEST_SDPA_BACKEND = SDPBackend.EFFICIENT_ATTENTION
 
         if deterministic:
-            raise NotImplementedError(
-                "Deterministic mode in attention is only supported when Flash Attention 3 is available."
-            )
+            raise NotImplementedError("Deterministic mode in attention is only supported when Flash Attention 3 is available.")
 
         # Torch 2.6 and later allows priorities for backends, but for older versions
         # we can only run with a specific backend. As long as we pick ones we're certain
