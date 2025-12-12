@@ -2,6 +2,9 @@ from tqdm import tqdm
 import argparse
 import torch
 from einops import rearrange, repeat
+from PIL import Image
+import torchvision.transforms.v2 as T
+import numpy as np
 
 from imaginaire.utils.io import save_image_or_video
 from imaginaire.lazy_config import LazyCall as L, LazyDict, instantiate
@@ -11,7 +14,7 @@ from rcm.datasets.utils import VIDEO_RES_SIZE_INFO
 from rcm.utils.umt5 import clear_umt5_memory, get_umt5_embedding
 from rcm.utils.model_utils import init_weights_on_device, load_state_dict
 from rcm.tokenizers.wan2pt1 import Wan2pt1VAEInterface
-from rcm.networks.wan2pt1 import WanModel
+from rcm.networks.wan2pt2 import WanModel
 from rcm.samplers.euler import FlowEulerSampler
 from rcm.samplers.unipc import FlowUniPCMultistepSampler
 
@@ -20,45 +23,52 @@ _DEFAULT_PROMPT = "A stylish woman walks down a Tokyo street filled with warm gl
 
 tensor_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
 
-WAN2PT1_1PT3B_T2V: LazyDict = L(WanModel)(
-    dim=1536,
-    eps=1e-06,
-    ffn_dim=8960,
-    freq_dim=256,
-    in_dim=16,
-    model_type="t2v",
-    num_heads=12,
-    num_layers=30,
-    out_dim=16,
-    text_len=512,
-)
-
-WAN2PT1_14B_T2V: LazyDict = L(WanModel)(
+WAN2PT2_A14B_I2V: LazyDict = L(WanModel)(
     dim=5120,
     eps=1e-06,
     ffn_dim=13824,
     freq_dim=256,
-    in_dim=16,
-    model_type="t2v",
+    in_dim=36,
+    model_type="i2v",
     num_heads=40,
     num_layers=40,
     out_dim=16,
     text_len=512,
 )
 
-dit_configs = {"1.3B": WAN2PT1_1PT3B_T2V, "14B": WAN2PT1_14B_T2V}
+dit_configs = {"A14B": WAN2PT2_A14B_I2V}
+
+
+def load_dit_model(model_path, model_config):
+    """Instantiates, loads state dict, and moves a DiT model to the correct device."""
+    with init_weights_on_device():
+        model = instantiate(model_config).eval()
+
+    state_dict = load_state_dict(model_path)
+    prefix_to_load = "net."
+    state_dict_dit_compatible = {k[len(prefix_to_load) :] if k.startswith(prefix_to_load) else k: v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict_dit_compatible, strict=True, assign=True)
+    del state_dict, state_dict_dit_compatible
+    log.success(f"Successfully loaded DiT from {model_path}")
+    return model
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Teacher inference script for Wan2.1 T2V")
-    parser.add_argument("--model_size", choices=["1.3B", "14B"], default="14B", help="Size of the model to use")
+    parser = argparse.ArgumentParser(description="Diffusion inference script for Wan2.2 I2V with High/Low Noise models")
+    parser.add_argument("--image_path", type=str, required=True, help="Path to the input image for I2V generation.")
+    parser.add_argument(
+        "--high_noise_model_path", type=str, default="assets/checkpoints/Wan2.2-I2V-A14B-high.pth", help="Path to the high-noise model."
+    )
+    parser.add_argument("--low_noise_model_path", type=str, default="assets/checkpoints/Wan2.2-I2V-A14B-low.pth", help="Path to the low-noise model.")
+    parser.add_argument("--boundary", type=float, default=0.9, help="Timestep boundary for switching from high to low noise model.")
+
+    parser.add_argument("--model_size", choices=["A14B"], default="A14B", help="Size of the model to use")
     parser.add_argument("--num_samples", type=int, default=4, help="Number of samples to generate")
     parser.add_argument("--num_steps", type=int, default=50, help="Number of sampling steps")
     parser.add_argument("--sigma_max", type=int, default=5000, help="Initial timestep represented by EDM sigma")
     parser.add_argument("--sampler", choices=["Euler", "UniPC"], default="UniPC", help="Sampler")
     parser.add_argument("--guidance_scale", type=float, default=5.0, help="CFG scale")
     parser.add_argument("--timestep_shift", type=float, default=5.0, help="Timestep shift as in Wan")
-    parser.add_argument("--dit_path", type=str, default="assets/checkpoints/Wan2.1-T2V-14B.pth", help="Path to the video diffusion model.")
     parser.add_argument("--vae_path", type=str, default="assets/checkpoints/Wan2.1_VAE.pth", help="Path to the Wan2.1 VAE.")
     parser.add_argument(
         "--text_encoder_path", type=str, default="assets/checkpoints/models_t5_umt5-xxl-enc-bf16.pth", help="Path to the umT5 text encoder."
@@ -66,8 +76,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
     parser.add_argument("--prompt", type=str, default=_DEFAULT_PROMPT, help="Text prompt for video generation")
     parser.add_argument("--negative_prompt", type=str, default=_DEFAULT_NEGATIVE_PROMPT, help="Negative text prompt for video generation")
-    parser.add_argument("--resolution", default="480p", type=str, help="Resolution of the generated output")
+    parser.add_argument("--resolution", default="720p", type=str, help="Resolution of the generated output")
     parser.add_argument("--aspect_ratio", default="16:9", type=str, help="Aspect ratio of the generated output (width:height)")
+    parser.add_argument(
+        "--adaptive_resolution",
+        action="store_true",
+        help="If set, adapts the output resolution to the input image's aspect ratio, "
+        "using the area defined by --resolution and --aspect_ratio as a target.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument(
         "--save_path", type=str, default="output/generated_video.mp4", help="Path to save the generated video (include file extension)"
@@ -77,29 +93,65 @@ def parse_arguments() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_arguments()
-
-    with init_weights_on_device():
-        net = instantiate(dit_configs[args.model_size]).eval()  # inference
-
-    state_dict = load_state_dict(args.dit_path)
-    prefix_to_load = "net."
-    # drop net. prefix
-    state_dict_dit_compatible = dict()
-    for k, v in state_dict.items():
-        if k.startswith(prefix_to_load):
-            state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
-        else:
-            state_dict_dit_compatible[k] = v
-    net.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
-    del state_dict, state_dict_dit_compatible
-    log.success(f"Successfully loaded DiT from {args.dit_path}")
-
-    net = net.to(**tensor_kwargs)
+    model_config = dit_configs[args.model_size]
+    high_noise_model = load_dit_model(args.high_noise_model_path, model_config).to(**tensor_kwargs).cpu()
+    low_noise_model = load_dit_model(args.low_noise_model_path, model_config).to(**tensor_kwargs).cpu()
     torch.cuda.empty_cache()
 
     tokenizer = Wan2pt1VAEInterface(vae_pth=args.vae_path)
 
-    w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
+    log.info(f"Loading and preprocessing image from: {args.image_path}")
+    input_image = Image.open(args.image_path).convert("RGB")
+    if args.adaptive_resolution:
+        log.info("Adaptive resolution mode enabled.")
+        base_w, base_h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
+        max_resolution_area = base_w * base_h
+        log.info(f"Target area is based on {args.resolution} {args.aspect_ratio} (~{max_resolution_area} pixels).")
+
+        orig_w, orig_h = input_image.size
+        image_aspect_ratio = orig_h / orig_w
+
+        ideal_w = np.sqrt(max_resolution_area / image_aspect_ratio)
+        ideal_h = np.sqrt(max_resolution_area * image_aspect_ratio)
+
+        stride = tokenizer.spatial_compression_factor * 2
+        lat_h = round(ideal_h / stride)
+        lat_w = round(ideal_w / stride)
+        h = lat_h * stride
+        w = lat_w * stride
+
+        log.info(f"Input image aspect ratio: {image_aspect_ratio:.4f}. Adaptive resolution set to: {w}x{h}")
+    else:
+        log.info("Fixed resolution mode.")
+        w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
+        log.info(f"Resolution set to: {w}x{h}")
+    F = args.num_frames
+    lat_h = h // tokenizer.spatial_compression_factor
+    lat_w = w // tokenizer.spatial_compression_factor
+    lat_t = tokenizer.get_latent_num_frames(F)
+
+    log.info(f"Preprocessing image to {w}x{h}...")
+    image_transforms = T.Compose(
+        [
+            T.ToImage(),
+            T.Resize(size=(h, w), antialias=True),
+            T.ToDtype(torch.float32, scale=True),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+    image_tensor = image_transforms(input_image).unsqueeze(0).to(device=tensor_kwargs["device"], dtype=torch.float32)
+
+    with torch.no_grad():
+        frames_to_encode = torch.cat(
+            [image_tensor.unsqueeze(2), torch.zeros(1, 3, F - 1, h, w, device=image_tensor.device)], dim=2
+        )  # -> B, C, T, H, W
+        encoded_latents = tokenizer.encode(frames_to_encode)  # -> B, C_lat, T_lat, H_lat, W_lat
+
+    msk = torch.zeros(1, 4, lat_t, lat_h, lat_w, device=tensor_kwargs["device"], dtype=tensor_kwargs["dtype"])
+    msk[:, :, 0, :, :] = 1.0
+
+    y = torch.cat([msk, encoded_latents.to(**tensor_kwargs)], dim=1)
+    y = y.repeat(args.num_samples, 1, 1, 1, 1)
 
     log.info(f"Computing embedding for prompt: {args.prompt}")
     text_emb = get_umt5_embedding(checkpoint_path=args.text_encoder_path, prompts=args.prompt).to(dtype=torch.bfloat16).cuda()
@@ -107,17 +159,12 @@ if __name__ == "__main__":
     clear_umt5_memory()
 
     log.info(f"Generating with prompt: {args.prompt}")
-    condition = {"crossattn_emb": repeat(text_emb.to(**tensor_kwargs), "b l d -> (k b) l d", k=args.num_samples)}
-    uncondition = {"crossattn_emb": repeat(neg_text_emb.to(**tensor_kwargs), "b l d -> (k b) l d", k=args.num_samples)}
+    condition = {"crossattn_emb": repeat(text_emb.to(**tensor_kwargs), "b l d -> (k b) l d", k=args.num_samples), "y_B_C_T_H_W": y}
+    uncondition = {"crossattn_emb": repeat(neg_text_emb.to(**tensor_kwargs), "b l d -> (k b) l d", k=args.num_samples), "y_B_C_T_H_W": y}
 
     to_show = []
 
-    state_shape = [
-        tokenizer.latent_ch,
-        tokenizer.get_latent_num_frames(args.num_frames),
-        h // tokenizer.spatial_compression_factor,
-        w // tokenizer.spatial_compression_factor,
-    ]
+    state_shape = [tokenizer.latent_ch, lat_t, lat_h, lat_w]
 
     generator = torch.Generator(device=tensor_kwargs["device"])
     generator.manual_seed(args.seed)
@@ -143,7 +190,16 @@ if __name__ == "__main__":
     # log.info(sampler.timesteps)
 
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+    high_noise_model.cuda()
+    net = high_noise_model
+    switched = False
     for _, t in enumerate(tqdm(sampler.timesteps)):
+        if t.item() < args.boundary * 1000 and not switched:
+            high_noise_model.cpu()
+            low_noise_model.cuda()
+            net = low_noise_model
+            switched = True
+            log.info("Switched to low noise model.")
         timesteps = t * ones
 
         with torch.no_grad():

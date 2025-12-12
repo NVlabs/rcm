@@ -81,7 +81,7 @@ PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
     --prompt "A cinematic shot of a snowy mountain at sunrise"
 ```
 
-See [Wan examples](Wan.md) for additional usage examples.
+See [Wan examples](Wan.md) for additional usage and I2V examples.
 
 ## Training
 In this repo, we provide training code based on Wan2.1 and its synthetic data.

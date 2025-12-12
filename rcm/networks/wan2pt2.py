@@ -328,7 +328,7 @@ class WanSelfAttention(nn.Module):
         self.attn_op.set_context_parallel_group(process_group, ranks, stream)
 
 
-class WanT2VCrossAttention(WanSelfAttention):
+class WanCrossAttention(WanSelfAttention):
     def forward(self, x, context, context_lens):
         r"""
         Args:
@@ -351,59 +351,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         return x
 
 
-class WanI2VCrossAttention(WanSelfAttention):
-    def __init__(self, dim, num_heads, qk_norm=True, eps=1e-6):
-        super().__init__(dim, num_heads, qk_norm, eps)
-
-        self.k_img = nn.Linear(dim, dim)
-        self.v_img = nn.Linear(dim, dim)
-        # self.alpha = nn.Parameter(torch.zeros((1, )))
-        self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.attn_op_image = MinimalA2AAttnOp()
-
-    def init_weights(self):
-        super().init_weights()
-        std = 1.0 / math.sqrt(self.dim)
-        torch.nn.init.trunc_normal_(self.k_img.weight, std=std)
-        torch.nn.init.trunc_normal_(self.v_img.weight, std=std)
-        # zero out bias
-        self.k_img.bias.data.zero_()
-        self.v_img.bias.data.zero_()
-        # reset norm weights
-        if self.qk_norm:
-            self.norm_k_img.reset_parameters()
-
-    def forward(self, x, context, context_lens):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
-        """
-        image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
-        context_img = context[:, :image_context_length]
-        context = context[:, image_context_length:]
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = self.attn_op_image(q, k_img, v_img)
-        # compute attention
-        x = self.attn_op(q, k, v)
-
-        # output
-        x = x.flatten(2)
-        img_x = img_x.flatten(2)
-        x = x + img_x
-        x = self.o(x)
-        return x
-
-
-WAN_CROSSATTENTION_CLASSES = {"t2v_cross_attn": WanT2VCrossAttention, "i2v_cross_attn": WanI2VCrossAttention}
+WAN_CROSSATTENTION_CLASSES = {"t2v_cross_attn": WanCrossAttention, "i2v_cross_attn": WanCrossAttention}
 
 
 class WanAttentionBlock(nn.Module):
@@ -517,8 +465,6 @@ class MLPProj(torch.nn.Module):
             torch.nn.Linear(in_dim, out_dim),
             torch.nn.LayerNorm(out_dim),
         )
-        if flf_pos_emb:  # NOTE: we only use this for `flf2v`
-            self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
 
     def init_weights(self):
         self.proj[0].reset_parameters()
@@ -566,7 +512,7 @@ class WanModel(nn.Module):
 
         Args:
             model_type (`str`, *optional*, defaults to 't2v'):
-                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video) or 'flf2v' (first-last-frame-to-video)
+                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
             patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
@@ -597,7 +543,7 @@ class WanModel(nn.Module):
 
         super().__init__()
 
-        assert model_type in ["t2v", "i2v", "flf2v"]
+        assert model_type in ["t2v", "i2v"]
         self.model_type = model_type
 
         self.patch_size = patch_size
@@ -639,9 +585,6 @@ class WanModel(nn.Module):
 
         self.rope_position_embedding = VideoRopePosition3DEmb(head_dim=d, len_h=128, len_w=128, len_t=32)
 
-        if model_type == "i2v" or model_type == "flf2v":
-            self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == "flf2v")
-
         # initialize weights
         self.init_weights()
 
@@ -652,7 +595,6 @@ class WanModel(nn.Module):
         x_B_C_T_H_W,
         timesteps_B_T,
         crossattn_emb,
-        frame_cond_crossattn_emb_B_L_D=None,
         y_B_C_T_H_W=None,
         **kwargs,
     ):
@@ -666,8 +608,6 @@ class WanModel(nn.Module):
                 Diffusion timesteps tensor of shape [B]
             context (List[Tensor]):
                 List of text embeddings each with shape [L, C]
-            frame_cond_crossattn_emb_B_L_D (Tensor, *optional*):
-                CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y_B_C_T_H_W (Tensor, *optional*):
                 Conditional video inputs for image-to-video mode, shape [B, C_in, T, H, W]
 
@@ -679,8 +619,8 @@ class WanModel(nn.Module):
         assert timesteps_B_T.shape[1] == 1
         t_B = timesteps_B_T[:, 0]
         del kwargs
-        if self.model_type == "i2v" or self.model_type == "flf2v":
-            assert frame_cond_crossattn_emb_B_L_D is not None and y_B_C_T_H_W is not None
+        if self.model_type == "i2v":
+            assert y_B_C_T_H_W is not None
 
         if y_B_C_T_H_W is not None:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, y_B_C_T_H_W], dim=1)
@@ -709,10 +649,6 @@ class WanModel(nn.Module):
         # context
         context_lens = None
         context_B_L_D = self.text_embedding(crossattn_emb)
-
-        if frame_cond_crossattn_emb_B_L_D is not None:
-            context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)  # bs x 257 (x2) x dim
-            context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
 
         # arguments
         kwargs = dict(

@@ -1151,7 +1151,6 @@ class WanModel_JVP(JVP):
         _context_fn = sac_config.get_context_fn()
         for block_id, block in self.blocks.named_children():
             if int(block_id) % sac_config.every_n_blocks == 0:
-                log.info(f"Enable selective checkpoint for block {block_id}")
                 block = ptd_checkpoint_wrapper(block, context_fn=_context_fn, preserve_rng_state=False)
                 self.blocks.register_module(block_id, block)
         self.register_module("head", ptd_checkpoint_wrapper(self.head, context_fn=_context_fn, preserve_rng_state=False))
