@@ -1,4 +1,4 @@
-<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model <br>🚀SOTA Diffusion Distillation & Few-Step Video Generation </h1>
+<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model <br>🚀SOTA JVP-Based Diffusion Distillation & Few-Step Video Generation </h1>
 <div align="center">
   <a href='https://arxiv.org/abs/2510.08431'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2510.08431-red?logo=arxiv'></a>  &nbsp;
   <a href='https://research.nvidia.com/labs/dir/rcm'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
