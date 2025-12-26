@@ -7,10 +7,10 @@
 ## Overview
 
 rCM is the first work that:
-- Scales up continuous-time consistency distillation (e.g., sCM/MeanFlow) to 10B+ parameter video diffusion models.
-- Provides open-sourced FlashAttention-2 Jacobian-vector product (JVP) kernel with support for parallelisms like FSDP/CP.
-- Identifies the quality bottleneck of sCM and overcomes it via a forward–reverse divergence joint distillation framework.
-- Delivers models that generate videos with both high quality and strong diversity in only 2~4 steps.
+- Scales up **continuous-time consistency distillation (e.g., sCM/MeanFlow)** to 10B+ parameter video diffusion models.
+- Provides open-sourced **FlashAttention-2 Jacobian-vector product (JVP) kernel** with support for parallelisms like FSDP/CP.
+- Identifies the quality bottleneck of sCM and overcomes it via a **forward–reverse divergence joint distillation** framework.
+- Delivers models that generate videos with both **high quality and strong diversity in only 2~4 steps**.
 
 #### Comparison with Other Diffusion Distillation Methods on Wan2.1 T2V 1.3B (4-step)
 
