@@ -89,12 +89,6 @@ def test_equivalent_forward_raw_vs_jvp():
     torch.testing.assert_close(output_BT, output_BT_jvp, rtol=1e-3, atol=1e-3)
 
 
-"""
-Usage:
-    pytest -s projects/cosmos/diffusion/v2/networks/wan2pt1_jvp_test.py --all -k test_equivalent_jvp_naive_vs_flash
-"""
-
-
 @pytest.mark.L1
 def test_equivalent_jvp_naive_vs_flash():
     dtype = torch.float16

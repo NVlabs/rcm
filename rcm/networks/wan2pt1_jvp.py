@@ -28,57 +28,14 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoi
 from imaginaire.utils import log
 from rcm.utils.a2a_cp import MinimalA2AAttnOp
 from rcm.utils.selective_activation_checkpoint import CheckpointMode, SACConfig
-from rcm.utils.context_parallel import split_inputs_cp
+from rcm.utils.context_parallel import split_inputs_cp, cat_outputs_cp, cat_outputs_cp_with_grad, broadcast
 from rcm.utils.jvp_helper import JVP, MinimalA2AAttnOpWithT, TensorWithT, naive_attention_op, torch_attention_op
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
-from collections import namedtuple
 
-VideoSize = namedtuple("VideoSize", ["T", "H", "W"])
-
-
-class VideoPositionEmb(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self._cp_group = None
-
-    def enable_context_parallel(self, process_group: ProcessGroup):
-        self._cp_group = process_group
-
-    def disable_context_parallel(self):
-        self._cp_group = None
-
-    @property
-    def seq_dim(self):
-        return 1
-
-    def forward(self, x_B_T_H_W_C: torch.Tensor) -> torch.Tensor:
-        """
-        With CP, the function assume that the input tensor is already split.
-        It delegates the embedding generation to generate_embeddings function.
-        """
-        B_T_H_W_C = x_B_T_H_W_C.shape
-        if self._cp_group is not None:
-            cp_ranks = get_process_group_ranks(self._cp_group)
-            cp_size = len(cp_ranks)
-            B, T, H, W, C = B_T_H_W_C
-            B_T_H_W_C = (B, T * cp_size, H, W, C)
-        embeddings = self.generate_embeddings(B_T_H_W_C)
-
-        return self._split_for_context_parallel(embeddings)
-
-    def generate_embeddings(self, B_T_H_W_C: torch.Size):
-        raise NotImplementedError
-
-    def _split_for_context_parallel(self, embeddings):
-        if self._cp_group is not None:
-            embeddings = split_inputs_cp(x=embeddings, seq_dim=self.seq_dim, cp_group=self._cp_group)
-        return embeddings
-
-
-class VideoRopePosition3DEmb(VideoPositionEmb):
+class VideoRopePosition3DEmb(nn.Module):
     def __init__(
         self,
         head_dim: int,
@@ -170,7 +127,7 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
             dim=-1,
         )
 
-        return rearrange(freqs_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+        return rearrange(freqs_T_H_W_D, "t h w d -> (t h w) d").float()
 
     @property
     def seq_dim(self):
@@ -216,14 +173,13 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
     )
 
 
-def rope_apply(x, video_size: VideoSize, freqs, fused):
+def rope_apply(x, freqs, fused):
     """
     Optimized version of rope_apply using flash_attention's rotary embedding implementation.
     This version processes the entire batch at once for efficiency.
 
     Args:
         x (Tensor): Input tensor with shape [batch_size, seq_len, n_heads, head_dim]
-        video_size (VideoSize): Video dimensions with shape [T, H, W]
         freqs (Tensor): Complex frequencies with shape [max_seq_len, head_dim // 2]
 
     Returns:
@@ -231,13 +187,7 @@ def rope_apply(x, video_size: VideoSize, freqs, fused):
     """
     batch_size, seq_len, n_heads, head_dim = x.shape
 
-    # Since all items in the batch share the same grid dimensions, we can use the first item
-    T, H, W = video_size
-    curr_seq_len = T * H * W
-
-    # Make sure the sequence length matches the grid size
-    assert seq_len == curr_seq_len, "Sequence length must be equal to T*H*W"
-
+    # freqs is already sharded to local seq_len under flattened CP
     freqs = freqs.view(seq_len, head_dim // 2)
     cos = torch.cos(freqs).to(torch.float32)
     sin = torch.sin(freqs).to(torch.float32)
@@ -334,12 +284,11 @@ class WanSelfAttention(JVP):
             self.norm_q.reset_parameters()
             self.norm_k.reset_parameters()
 
-    def _forward(self, x: torch.Tensor, seq_lens, video_size: VideoSize, freqs):
+    def _forward(self, x: torch.Tensor, seq_lens, freqs):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
-            video_size(VideoSize): Shape [T, H, W]
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -353,14 +302,14 @@ class WanSelfAttention(JVP):
 
         q, k, v = qkv_fn(x)
 
-        x = self.attn_op(rope_apply(q, video_size, freqs, fused=False), rope_apply(k, video_size, freqs, fused=False), v)
+        x = self.attn_op(rope_apply(q, freqs, fused=False), rope_apply(k, freqs, fused=False), v)
 
         # output
         x = x.flatten(2)
         x = self.o(x)
         return x
 
-    def _forward_jvp(self, x: TensorWithT, seq_lens, video_size: VideoSize, freqs):
+    def _forward_jvp(self, x: TensorWithT, seq_lens, freqs):
         x_withT = x
         x, t_x = x_withT
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -370,8 +319,8 @@ class WanSelfAttention(JVP):
             q = self.norm_q(self.q(x)).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
-            q = rope_apply(q, video_size, freqs, fused=False)
-            k = rope_apply(k, video_size, freqs, fused=False)
+            q = rope_apply(q, freqs, fused=False)
+            k = rope_apply(k, freqs, fused=False)
             return q, k, v
 
         (q, k, v), (t_q, t_k, t_v) = torch.func.jvp(qkv_fn, (x,), (t_x,))
@@ -575,13 +524,12 @@ class WanAttentionBlock(JVP):
         std = 1.0 / math.sqrt(self.dim)
         torch.nn.init.trunc_normal_(self.modulation, std=std)
 
-    def _forward(self, x, e, seq_lens, video_size: VideoSize, freqs, context, context_lens):
+    def _forward(self, x, e, seq_lens, freqs, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
             e(Tensor): Shape [B, 6, C]
             seq_lens(Tensor): Shape [B], length of each sequence in batch
-            video_size(VideoSize): Shape [T, H, W]
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
@@ -590,7 +538,7 @@ class WanAttentionBlock(JVP):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, video_size, freqs)
+        y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, freqs)
         with amp.autocast("cuda", dtype=torch.float32):
             x = (x + y * e[2]).type_as(x)
 
@@ -605,13 +553,12 @@ class WanAttentionBlock(JVP):
         x = cross_attn_ffn(x, context, context_lens, e)
         return x
 
-    def _forward_jvp(self, x: TensorWithT, e: TensorWithT, seq_lens, video_size: VideoSize, freqs, context, context_lens):
+    def _forward_jvp(self, x: TensorWithT, e: TensorWithT, seq_lens, freqs, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
             e(Tensor): Shape [B, 6, C]
             seq_lens(Tensor): Shape [B], length of each sequence in batch
-            video_size(VideoSize): Shape [T, H, W]
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         x_withT, e_withT = x, e
@@ -631,7 +578,7 @@ class WanAttentionBlock(JVP):
         z_withT, e_withT = (z, t_z.detach()), (e, tuple([_.detach() for _ in t_e]))
 
         # self-attention
-        y_withT = self.self_attn(z_withT, seq_lens, video_size, freqs, withT=True)
+        y_withT = self.self_attn(z_withT, seq_lens, freqs, withT=True)
         y, t_y = y_withT
 
         def pre_cross_attn_fn(x, e2, y):
@@ -886,22 +833,41 @@ class WanModel_JVP(JVP):
         if self.model_type == "i2v" or self.model_type == "flf2v":
             assert frame_cond_crossattn_emb_B_L_D is not None and y_B_C_T_H_W is not None
 
+        cp_group = getattr(self, "_cp_group", None)
+        cp_enabled = (cp_group is not None) and (cp_group.size() > 1)
+        if cp_enabled:
+            x_B_C_T_H_W = broadcast(x_B_C_T_H_W, cp_group)
+            timesteps_B_T = broadcast(timesteps_B_T, cp_group)
+            crossattn_emb = broadcast(crossattn_emb, cp_group)
+            if frame_cond_crossattn_emb_B_L_D is not None:
+                frame_cond_crossattn_emb_B_L_D = broadcast(frame_cond_crossattn_emb_B_L_D, cp_group)
+            if y_B_C_T_H_W is not None:
+                y_B_C_T_H_W = broadcast(y_B_C_T_H_W, cp_group)
+
         if y_B_C_T_H_W is not None:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, y_B_C_T_H_W], dim=1)
 
-        # embeddings
-        x_B_T_H_W_D = rearrange(
+        kt, kh, kw = self.patch_size
+        B, _, T_in, H_in, W_in = x_B_C_T_H_W.shape
+        assert (T_in % kt) == 0 and (H_in % kh) == 0 and (W_in % kw) == 0
+        T, H, W = T_in // kt, H_in // kh, W_in // kw
+        L = T * H * W
+
+        # patchify and flatten
+        x_B_L_Din = rearrange(
             x_B_C_T_H_W,
-            "b c (t kt) (h kh) (w kw) -> b t h w (c kt kh kw)",
-            kt=self.patch_size[0],
-            kh=self.patch_size[1],
-            kw=self.patch_size[2],
-        )
+            "b c (t kt) (h kh) (w kw) -> b (t h w) (c kt kh kw)",
+            kt=kt,
+            kh=kh,
+            kw=kw,
+        ).contiguous()
 
-        x_B_T_H_W_D = self.patch_embedding(x_B_T_H_W_D)
+        if cp_enabled:
+            assert (L % cp_group.size()) == 0, f"L=T*H*W must be divisible by cp_size. Got L={L}, cp={cp_group.size()}."
+            x_B_L_Din = split_inputs_cp(x_B_L_Din, seq_dim=1, cp_group=cp_group)
 
-        video_size = VideoSize(T=x_B_T_H_W_D.shape[1], H=x_B_T_H_W_D.shape[2], W=x_B_T_H_W_D.shape[3])
-        x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
+        # embeddings
+        x_B_L_D = self.patch_embedding(x_B_L_Din)
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
 
         # time embeddings
@@ -918,12 +884,15 @@ class WanModel_JVP(JVP):
             context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)  # bs x 257 (x2) x dim
             context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
 
+        freqs = self.rope_position_embedding.generate_embeddings(torch.Size([B, T, H, W, self.dim])).contiguous()
+        if cp_enabled:
+            freqs = split_inputs_cp(freqs, seq_dim=self.rope_position_embedding.seq_dim, cp_group=cp_group)
+
         # arguments
         kwargs = dict(
             e=e0_B_6_D,
             seq_lens=seq_lens,
-            video_size=video_size,
-            freqs=self.rope_position_embedding(x_B_T_H_W_D),
+            freqs=freqs,
             context=context_B_L_D,
             context_lens=context_lens,
         )
@@ -932,19 +901,24 @@ class WanModel_JVP(JVP):
             x_B_L_D = block(x_B_L_D, **kwargs)
 
         # head
-        x_B_L_D = self.head(x_B_L_D, e_B_D)
+        x_B_L_Dout = self.head(x_B_L_D, e_B_D)
+
+        if cp_enabled:
+            if torch.is_grad_enabled():
+                x_B_L_Dout = cat_outputs_cp_with_grad(x_B_L_Dout, seq_dim=1, cp_group=cp_group)
+            else:
+                x_B_L_Dout = cat_outputs_cp(x_B_L_Dout, seq_dim=1, cp_group=cp_group)
 
         # unpatchify
-        t, h, w = video_size
         x_B_C_T_H_W = rearrange(
-            x_B_L_D,
-            "b (t h w) (nt nh nw d) -> b d (t nt) (h nh) (w nw)",
-            nt=self.patch_size[0],
-            nh=self.patch_size[1],
-            nw=self.patch_size[2],
-            t=t,
-            h=h,
-            w=w,
+            x_B_L_Dout,
+            "b (t h w) (kt kh kw d) -> b d (t kt) (h kh) (w kw)",
+            kt=kt,
+            kh=kh,
+            kw=kw,
+            t=T,
+            h=H,
+            w=W,
             d=self.out_dim,
         )
 
@@ -963,38 +937,59 @@ class WanModel_JVP(JVP):
         x_B_C_T_H_W, t_x_B_C_T_H_W = x_B_C_T_H_W_withT
         timesteps_B_T, t_timesteps_B_T = timesteps_B_T_withT
 
-        assert timesteps_B_T.shape[1] == 1
+        assert timesteps_B_T.shape[1] == 1 and t_timesteps_B_T.shape[1] == 1
         t_B = timesteps_B_T[:, 0]
         t_t_B = t_timesteps_B_T[:, 0]
         del kwargs
         if self.model_type == "i2v" or self.model_type == "flf2v":
             assert frame_cond_crossattn_emb_B_L_D is not None and y_B_C_T_H_W is not None
 
+        cp_group = getattr(self, "_cp_group", None)
+        cp_enabled = (cp_group is not None) and (cp_group.size() > 1)
+        if cp_enabled:
+            x_B_C_T_H_W = broadcast(x_B_C_T_H_W, cp_group)
+            t_x_B_C_T_H_W = broadcast(t_x_B_C_T_H_W, cp_group)
+            timesteps_B_T = broadcast(timesteps_B_T, cp_group)
+            t_timesteps_B_T = broadcast(t_timesteps_B_T, cp_group)
+            crossattn_emb = broadcast(crossattn_emb, cp_group)
+            if frame_cond_crossattn_emb_B_L_D is not None:
+                frame_cond_crossattn_emb_B_L_D = broadcast(frame_cond_crossattn_emb_B_L_D, cp_group)
+            if y_B_C_T_H_W is not None:
+                y_B_C_T_H_W = broadcast(y_B_C_T_H_W, cp_group)
+
         if y_B_C_T_H_W is not None:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, y_B_C_T_H_W], dim=1)
             t_x_B_C_T_H_W = torch.cat([t_x_B_C_T_H_W, torch.zeros_like(y_B_C_T_H_W)], dim=1)
 
-        # embeddings
-        x_B_T_H_W_D = rearrange(
+        kt, kh, kw = self.patch_size
+        B, _, T_in, H_in, W_in = x_B_C_T_H_W.shape
+        assert (T_in % kt) == 0 and (H_in % kh) == 0 and (W_in % kw) == 0
+        T, H, W = T_in // kt, H_in // kh, W_in // kw
+        L = T * H * W
+
+        # patchify and flatten
+        x_B_L_Din = rearrange(
             x_B_C_T_H_W,
-            "b c (t kt) (h kh) (w kw) -> b t h w (c kt kh kw)",
-            kt=self.patch_size[0],
-            kh=self.patch_size[1],
-            kw=self.patch_size[2],
-        )
-        t_x_B_T_H_W_D = rearrange(
+            "b c (t kt) (h kh) (w kw) -> b (t h w) (c kt kh kw)",
+            kt=kt,
+            kh=kh,
+            kw=kw,
+        ).contiguous()
+        t_x_B_L_Din = rearrange(
             t_x_B_C_T_H_W,
-            "b c (t kt) (h kh) (w kw) -> b t h w (c kt kh kw)",
-            kt=self.patch_size[0],
-            kh=self.patch_size[1],
-            kw=self.patch_size[2],
-        )
+            "b c (t kt) (h kh) (w kw) -> b (t h w) (c kt kh kw)",
+            kt=kt,
+            kh=kh,
+            kw=kw,
+        ).contiguous()
 
-        x_B_T_H_W_D, t_x_B_T_H_W_D = torch.func.jvp(self.patch_embedding, (x_B_T_H_W_D,), (t_x_B_T_H_W_D,))
+        if cp_enabled:
+            assert (L % cp_group.size()) == 0, f"L=T*H*W must be divisible by cp_size. Got L={L}, cp={cp_group.size()}."
+            x_B_L_Din = split_inputs_cp(x_B_L_Din, seq_dim=1, cp_group=cp_group)
+            t_x_B_L_Din = split_inputs_cp(t_x_B_L_Din, seq_dim=1, cp_group=cp_group)
 
-        video_size = VideoSize(T=x_B_T_H_W_D.shape[1], H=x_B_T_H_W_D.shape[2], W=x_B_T_H_W_D.shape[3])
-        x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
-        t_x_B_L_D = rearrange(t_x_B_T_H_W_D, "b t h w d -> b (t h w) d")
+        # embeddings
+        x_B_L_D, t_x_B_L_D = torch.func.jvp(self.patch_embedding, (x_B_L_Din,), (t_x_B_L_Din,))
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
 
         def time_embed_fn(t):
@@ -1022,12 +1017,15 @@ class WanModel_JVP(JVP):
             context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)  # bs x 257 (x2) x dim
             context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
 
+        freqs = self.rope_position_embedding.generate_embeddings(torch.Size([B, T, H, W, self.dim])).contiguous()
+        if cp_enabled:
+            freqs = split_inputs_cp(freqs, seq_dim=self.rope_position_embedding.seq_dim, cp_group=cp_group)
+
         # arguments
         kwargs = dict(
             e=e0_B_6_D_withT,
             seq_lens=seq_lens,
-            video_size=video_size,
-            freqs=self.rope_position_embedding(x_B_T_H_W_D),
+            freqs=freqs,
             context=context_B_L_D,
             context_lens=context_lens,
         )
@@ -1036,31 +1034,37 @@ class WanModel_JVP(JVP):
             x_B_L_D_withT = block(x_B_L_D_withT, **kwargs, withT=True)
 
         # head
-        x_B_L_D_withT = self.head(x_B_L_D_withT, e_B_D_withT, withT=True)
-        x_B_L_D, t_x_B_L_D = x_B_L_D_withT
+        x_B_L_Dout_withT = self.head(x_B_L_D_withT, e_B_D_withT, withT=True)
+        x_B_L_Dout, t_x_B_L_Dout = x_B_L_Dout_withT
+
+        if cp_enabled:
+            if torch.is_grad_enabled():
+                x_B_L_Dout = cat_outputs_cp_with_grad(x_B_L_Dout, seq_dim=1, cp_group=cp_group)
+            else:
+                x_B_L_Dout = cat_outputs_cp(x_B_L_Dout, seq_dim=1, cp_group=cp_group)
+            t_x_B_L_Dout = cat_outputs_cp(t_x_B_L_Dout, seq_dim=1, cp_group=cp_group)
 
         # unpatchify
-        t, h, w = video_size
         x_B_C_T_H_W = rearrange(
-            x_B_L_D,
-            "b (t h w) (nt nh nw d) -> b d (t nt) (h nh) (w nw)",
-            nt=self.patch_size[0],
-            nh=self.patch_size[1],
-            nw=self.patch_size[2],
-            t=t,
-            h=h,
-            w=w,
+            x_B_L_Dout,
+            "b (t h w) (kt kh kw d) -> b d (t kt) (h kh) (w kw)",
+            kt=kt,
+            kh=kh,
+            kw=kw,
+            t=T,
+            h=H,
+            w=W,
             d=self.out_dim,
         )
         t_x_B_C_T_H_W = rearrange(
-            t_x_B_L_D,
-            "b (t h w) (nt nh nw d) -> b d (t nt) (h nh) (w nw)",
-            nt=self.patch_size[0],
-            nh=self.patch_size[1],
-            nw=self.patch_size[2],
-            t=t,
-            h=h,
-            w=w,
+            t_x_B_L_Dout,
+            "b (t h w) (kt kh kw d) -> b d (t kt) (h kh) (w kw)",
+            kt=kt,
+            kh=kh,
+            kw=kw,
+            t=T,
+            h=H,
+            w=W,
             d=self.out_dim,
         )
 
@@ -1118,8 +1122,6 @@ class WanModel_JVP(JVP):
         # fully_shard(self.patch_embedding, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
 
     def disable_context_parallel(self):
-        # pos_embedder
-        self.rope_position_embedding.disable_context_parallel()
         # attention
         for block in self.blocks:
             block.self_attn.set_context_parallel_group(
@@ -1129,15 +1131,15 @@ class WanModel_JVP(JVP):
             )
 
         self._is_context_parallel_enabled = False
+        self._cp_group = None
 
     def enable_context_parallel(self, process_group: Optional[ProcessGroup] = None):
-        # pos_embedder
-        self.rope_position_embedding.enable_context_parallel(process_group=process_group)
         cp_ranks = get_process_group_ranks(process_group)
         for block in self.blocks:
             block.self_attn.set_context_parallel_group(process_group=process_group, ranks=cp_ranks, stream=torch.cuda.Stream())
 
         self._is_context_parallel_enabled = True
+        self._cp_group = process_group
 
     @property
     def is_context_parallel_enabled(self):

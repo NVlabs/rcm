@@ -120,7 +120,7 @@ git clone https://huggingface.co/datasets/worstcoder/Wan_datasets assets/dataset
 Single-node training example:
 
 ```bash
-WORKDIR="/your/path/to/rcm"
+WORKDIR="/path/to/rcm"
 cd $WORKDIR
 export PYTHONPATH=.
 

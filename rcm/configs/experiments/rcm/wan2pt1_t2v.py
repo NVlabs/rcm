@@ -185,7 +185,7 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
         ),
         model=dict(
             config=dict(
-                state_t=20,
+                state_t=21,
                 fsdp_shard_size=32,
                 student_update_freq=10,
                 optimizer_fake_score=dict(
@@ -193,7 +193,7 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
                     weight_decay=0.01,
                     betas=(0.0, 0.999),
                 ),
-                tangent_warmup=300,
+                tangent_warmup=1,
                 teacher_ckpt="assets/checkpoints/Wan2.1-T2V-14B.dcp/model",
                 net=dict(
                     sac_config=dict(
@@ -218,7 +218,7 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
             ),
         ),
         model_parallel=dict(
-            context_parallel_size=10,
+            context_parallel_size=8,
         ),
     ),
     flags={"allow_objects": True},
