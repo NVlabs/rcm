@@ -448,7 +448,8 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         Assumes EDM-scaling parameterization.
 
-        Compared to base class denoise function, this function supports different net types:
+        This function supports different net types:
+        - teacher: the teacher diffusion model
         - fake_score: the fake score net on student generator's outputs
         - student: the student net (few-step generator)
 
@@ -458,8 +459,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
             condition (TextCondition): conditional information, generated from self.conditioner
 
         Returns:
-            DenoisePrediction: The denoised prediction, it includes clean data predicton (x0), \
-                noise prediction (eps_pred).
+            DenoisePrediction: The denoised prediction, it includes clean data predicton (x0) and velocity prediction (F).
         """
         if time.ndim == 1:
             time_B_T = repeat(time, "b -> b 1")
@@ -751,19 +751,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
     @torch.no_grad()
     def forward(self, xt, t, condition: TextCondition):
-        """
-        Performs denoising on the input noise data, noise level, and condition
-
-        Args:
-            xt (torch.Tensor): The input noise data.
-            sigma (torch.Tensor): The noise level.
-            condition (TextCondition): conditional information, generated from self.conditioner
-
-        Returns:
-            DenoisePrediction: The denoised prediction, it includes clean data predicton (x0), \
-                noise prediction (eps_pred).
-        """
-        return self.denoise(xt, t, condition)
+        pass
 
     # ------------------------ Sampling ------------------------
 

@@ -185,6 +185,7 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
         ),
         model=dict(
             config=dict(
+                loss_scale=1000,
                 state_t=21,
                 fsdp_shard_size=32,
                 student_update_freq=10,
