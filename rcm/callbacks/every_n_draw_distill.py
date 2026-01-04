@@ -222,7 +222,7 @@ class EveryNDrawSample_Distill(EveryN):
         )
         if hasattr(model, "decode"):
             sample_1 = model.decode(sample_1)
-        to_show.append(sample_1.float().cpu())
+        to_show.append(sample_1.cpu())
 
         sample_2 = model.generate_samples_from_batch(
             data_batch,
@@ -233,7 +233,7 @@ class EveryNDrawSample_Distill(EveryN):
         )
         if hasattr(model, "decode"):
             sample_2 = model.decode(sample_2)
-        to_show.append(sample_2.float().cpu())
+        to_show.append(sample_2.cpu())
 
         sample_teacher = model.generate_samples_from_batch_teacher(
             data_batch,
@@ -245,12 +245,12 @@ class EveryNDrawSample_Distill(EveryN):
         if hasattr(model, "decode"):
             sample_teacher = model.decode(sample_teacher)
 
-        to_show.append(sample_teacher.float().cpu())
+        to_show.append(sample_teacher.cpu())
 
         MSE = torch.mean((sample_1.float() - sample_teacher.float()) ** 2)
         dist.all_reduce(MSE, op=dist.ReduceOp.AVG)
 
-        to_show.append(raw_data.float().cpu())
+        to_show.append(raw_data.cpu())
 
         base_fp_wo_ext = f"{tag}_ReplicateID{self.data_parallel_id:04d}_Sample_Iter{iteration:09d}"
 
@@ -288,7 +288,8 @@ class EveryNDrawSample_Distill(EveryN):
             if hasattr(model, "decode"):
                 video = model.decode(sample)
 
-            to_show.append(video.float().cpu())
+            to_show.append(video.cpu())
+            del sample, video
 
         base_fp_wo_ext = f"0_{tag}_Sample_Iter{iteration:09d}"
 

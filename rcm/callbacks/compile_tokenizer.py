@@ -20,7 +20,7 @@ from imaginaire.utils.callback import Callback
 
 
 class CompileTokenizer(Callback):
-    def __init__(self, enabled: bool = False, compile_after_iterations: int = 4, dynamic: bool = False):
+    def __init__(self, enabled: bool = False, compile_after_iterations: int = 0, dynamic: bool = False):
         super().__init__()
         self.enabled = enabled
         self.compiled = False

@@ -332,21 +332,11 @@ class T2VDistillModel_rCM(ImaginaireModel):
         """
         update the net_ema
         """
-
-        del scheduler, optimizer
-
         # the net and its master weights are handled by the low precision callback
         # manually update the fake score if needed
         if not self.is_student_phase(iteration):
             if self.net_fake_score:
-                optimizer = self.optimizer_dict["fake_score"]
-                update_master_weights(optimizer)
-
-        if self.net_fake_score:
-            scheduler, optimizer = self.optimizer_dict["fake_score"], self.scheduler_dict["fake_score"]
-            del scheduler, optimizer
-
-        if not self.is_student_phase(iteration):
+                update_master_weights(self.optimizer_dict["fake_score"])
             return
 
         if self.config.ema.enabled:

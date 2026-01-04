@@ -193,10 +193,10 @@ class FusedAdam(torch.optim.Optimizer):
                 if len(state) == 0:
                     # Exponential moving average of gradient values
                     # Change that makes .step() not crash
-                    state["exp_avg"] = torch.zeros_like(get_local_tensor_if_DTensor(p).data).float()
+                    state["exp_avg"] = torch.zeros_like(get_local_tensor_if_DTensor(p).data, dtype=torch.float32)
                     # Exponential moving average of squared gradient values
                     # Change that makes .step() not crash
-                    state["exp_avg_sq"] = torch.zeros_like(get_local_tensor_if_DTensor(p).data).float()
+                    state["exp_avg_sq"] = torch.zeros_like(get_local_tensor_if_DTensor(p).data, dtype=torch.float32)
 
                 if p.dtype == torch.float16:
                     if self.master_weights:

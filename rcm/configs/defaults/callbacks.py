@@ -45,8 +45,8 @@ BASIC_CALLBACKS = dict(
     ),
     manual_gc=L(ManualGarbageCollection)(every_n=5),
     compile_tokenizer=L(CompileTokenizer)(
-        enabled=True,
-        compile_after_iterations=4,
+        enabled=False,
+        compile_after_iterations=0,
         dynamic=False,  # If there are issues with constant recompilations you may set this value to None or True
     ),
 )

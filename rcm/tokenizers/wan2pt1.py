@@ -75,7 +75,9 @@ class Upsample(nn.Upsample):
         """
         Fix bfloat16 support for nearest neighbor interpolation.
         """
-        return super().forward(x.float()).type_as(x)
+        # return super().forward(x.float()).type_as(x)
+        # Newer PyTorch versions support bf16 in "nearest-exact" interpolation; dropping x.float() saves memory and computation without loss of precision.
+        return super().forward(x)
 
 
 class Resample(nn.Module):
@@ -593,13 +595,7 @@ def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
             model.to_empty(device=device)
     sync_model_states(model)
 
-    return (
-        model,
-        torch.zeros(1, 1, 1, 1, 1, device=device),
-        torch.ones(1, 1, 1, 1, 1, device=device),
-        torch.zeros(1, 1, 50, 1, 1, device=device),
-        torch.ones(1, 1, 50, 1, 1, device=device),
-    )
+    return model
 
 
 class WanVAE:
@@ -649,9 +645,7 @@ class WanVAE:
         self.scale = [self.mean, 1.0 / self.std]
 
         # init model
-        self.model, self.img_mean, self.img_std, self.video_mean, self.video_std = _video_vae(
-            pretrained_path=vae_pth, z_dim=z_dim, device=device, temporal_window=temporal_window
-        )
+        self.model = _video_vae(pretrained_path=vae_pth, z_dim=z_dim, device=device, temporal_window=temporal_window)
         self.model = self.model.eval().requires_grad_(False)
         self.is_amp = is_amp
         if not is_amp:
@@ -695,22 +689,6 @@ class Wan2pt1VAEInterface(VideoTokenizerInterface):
             vae_pth=kwargs.get("vae_pth", ""),
             temporal_window=kwargs.get("temporal_window", 4),
         )
-        if kwargs.get("compile_encode", False) and hasattr(torch, "compile"):
-            torch_compile_available = True
-            try:
-                # PyTorch >= 2.7
-                torch._dynamo.config.recompile_limit = 32
-            except AttributeError:
-                try:
-                    torch._dynamo.config.cache_size_limit = 32
-                except AttributeError:
-                    log.warning("`compile_encode=True` requested, but Torch Dynamo is unavailable – skipping compilation.")
-                    torch_compile_available = False
-            if torch_compile_available:
-                log.warning(
-                    "The 'model.config.tokenizer.compile_encode' config option is deprecated. Please switch to using CompileTokenizer callback."
-                )
-                self.encode = torch.compile(self.encode, dynamic=False)
         del kwargs
         self.chunk_duration = chunk_duration
 
@@ -722,21 +700,10 @@ class Wan2pt1VAEInterface(VideoTokenizerInterface):
         pass
 
     def encode(self, state: torch.Tensor) -> torch.Tensor:
-        latents = self.model.encode(state)
-        num_frames = latents.shape[2]
-        if num_frames == 1:
-            return (latents - self.model.img_mean.type_as(latents)) / self.model.img_std.type_as(latents)
-        else:
-            return (latents - self.model.video_mean[:, :, :num_frames].type_as(latents)) / self.model.video_std[:, :, :num_frames].type_as(latents)
+        return self.model.encode(state)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        num_frames = latent.shape[2]
-        if num_frames == 1:
-            return self.model.decode((latent * self.model.img_std.type_as(latent)) + self.model.img_mean.type_as(latent))
-        else:
-            return self.model.decode(
-                (latent * self.model.video_std[:, :, :num_frames].type_as(latent)) + self.model.video_mean[:, :, :num_frames].type_as(latent)
-            )
+        return self.model.decode(latent)
 
     def get_latent_num_frames(self, num_pixel_frames: int) -> int:
         return 1 + (num_pixel_frames - 1) // 4
