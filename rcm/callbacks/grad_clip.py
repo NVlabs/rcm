@@ -66,9 +66,7 @@ class GradClip(Callback):
         self.video_mag_log = _MagnitudeRecord()
         self._cur_state = None
 
-    def on_training_step_start(
-        self, model, data_batch: dict[str, torch.Tensor], iteration: int = 0
-    ) -> None:
+    def on_training_step_start(self, model, data_batch: dict[str, torch.Tensor], iteration: int = 0) -> None:
         if model.is_image_batch(data_batch):
             self._cur_state = self.img_mag_log
         else:
@@ -95,9 +93,9 @@ class GradClip(Callback):
                     params.append(param.grad)
             _fused_nan_to_num(params)
 
-        total_norm = model.clip_grad_norm_(self.clip_norm)
-
-        self._cur_state.update(total_norm)
+        total_norm = model.clip_grad_norm_(self.clip_norm, iteration=iteration)
+        if total_norm is not None:
+            self._cur_state.update(total_norm)
         if iteration % self.config.trainer.logging_iter == 0:
             avg_img_mag, avg_video_mag = self.img_mag_log.get_stat(), self.video_mag_log.get_stat()
             if wandb.run:

@@ -43,8 +43,7 @@ from imaginaire.model import ImaginaireModel
 from imaginaire.utils import log, misc
 from imaginaire.utils.easy_io import easy_io
 from imaginaire.utils.ema import FastEmaModelUpdater
-from imaginaire.callbacks.low_precision import update_master_weights
-from rcm.conditioner import DataType, TextCondition, concat_condition
+from rcm.conditioner import DataType, TextCondition
 from rcm.utils.optim_instantiate_dtensor import get_base_scheduler
 from rcm.utils.lognormal import LogNormal
 from rcm.utils.checkpointer import non_strict_load_model
@@ -332,14 +331,8 @@ class T2VDistillModel_rCM(ImaginaireModel):
         """
         update the net_ema
         """
-        # the net and its master weights are handled by the low precision callback
-        # manually update the fake score if needed
-        if not self.is_student_phase(iteration):
-            if self.net_fake_score:
-                update_master_weights(self.optimizer_dict["fake_score"])
-            return
 
-        if self.config.ema.enabled:
+        if self.config.ema.enabled and self.is_student_phase(iteration):
             # calculate beta for EMA update
             ema_beta = self.ema_beta(self.get_effective_iteration(iteration))
             self.net_ema_worker.update_average(self.net, self.net_ema, beta=ema_beta)
@@ -380,25 +373,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
             return [self.scheduler_dict["net"]]
         else:
             return [self.scheduler_dict["fake_score"]]
-
-    def optimizers_zero_grad(self, iteration: int) -> None:
-        """
-        Zero the gradients of the optimizers based on the iteration
-        """
-        for optimizer in self.get_optimizers(iteration):
-            optimizer.zero_grad()
-
-    def optimizers_schedulers_step(self, grad_scaler: torch.cuda.amp.GradScaler, iteration: int) -> None:
-        """
-        Step the optimizer and scheduler step based on the iteration,
-        and gradient scaler is also updated
-        """
-        for optimizer in self.get_optimizers(iteration):
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-
-        for scheduler in self.get_lr_schedulers(iteration):
-            scheduler.step()
 
     def draw_training_time_G(self, x0_size: int, condition: Any) -> torch.Tensor:
         batch_size = x0_size[0]
@@ -532,17 +506,40 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         return (F_pred_B_C_T_H_W, t_F_pred_B_C_T_H_W.detach())
 
-    def training_step_generator(self, x0_B_C_T_H_W: torch.Tensor, condition: TextCondition, uncondition: TextCondition, iteration: int):
-        log.debug(f"Student update {iteration}")
+    def backward_simulation(self, condition, x_B_C_T_H_W_size, n_steps, with_grad: bool = False):
+        G_time_B_1 = math.pi / 2 * torch.ones(x_B_C_T_H_W_size[0], 1, device="cuda")
+        x_B_C_T_H_W = torch.randn(x_B_C_T_H_W_size, device="cuda")
+        x_B_C_T_H_W = self.sync(x_B_C_T_H_W)
+        t_traj, x_traj = [G_time_B_1], [x_B_C_T_H_W]
+        for _ in range(n_steps - 1):
+            G_time_B_1 = torch.minimum(self.draw_training_time_D(x_B_C_T_H_W_size, condition), G_time_B_1)
+            G_time_B_1 = self.sync(G_time_B_1)
+            t_traj.append(G_time_B_1)
+        t_traj.append(0 * G_time_B_1)
+        for step, (t_cur_B_1, t_next_B_1) in enumerate(zip(t_traj[:-1], t_traj[1:])):
+            context_fn = torch.enable_grad if with_grad and step == n_steps - 1 else torch.no_grad
+            with context_fn():
+                x_B_C_T_H_W = self.denoise(x_B_C_T_H_W, t_cur_B_1, condition, net_type="student").x0.float()
+            if step < n_steps - 1:
+                x_B_C_T_H_W = math.cos(rearrange(t_next_B_1, "b t -> b 1 t 1 1")) * x_B_C_T_H_W + math.sin(
+                    rearrange(t_next_B_1, "b t -> b 1 t 1 1")
+                ) * self.sync(torch.randn_like(x_B_C_T_H_W))
+            x_traj.append(x_B_C_T_H_W.detach())
+        return x_B_C_T_H_W, (t_traj, x_traj)
+
+    def _make_student_ctx(self, x0_B_C_T_H_W, condition, uncondition, iteration):
+        x0_B_C_T_H_W, condition, uncondition = self.sync(x0_B_C_T_H_W, condition, uncondition)
+        return (x0_B_C_T_H_W, condition, uncondition)
+
+    def _student_scm_step(self, ctx, iteration):
+        log.debug(f"Student update {iteration} (sCM)")
+        x0_B_C_T_H_W, condition, uncondition = ctx
         time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
-        x0_B_C_T_H_W, time_B_T, epsilon_B_C_T_H_W, condition, uncondition = self.sync(
-            x0_B_C_T_H_W, time_B_T, epsilon_B_C_T_H_W, condition, uncondition
-        )
+        time_B_T, epsilon_B_C_T_H_W = self.sync(time_B_T, epsilon_B_C_T_H_W)
 
         time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
         cost_B_1_T_1_1, sint_B_1_T_1_1 = torch.cos(time_B_1_T_1_1), torch.sin(time_B_1_T_1_1)
-        # Generate noisy observations
         xt_B_C_T_H_W = x0_B_C_T_H_W * cost_B_1_T_1_1 + epsilon_B_C_T_H_W * sint_B_1_T_1_1
         with torch.no_grad():
             F_teacher_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="teacher").F
@@ -571,30 +568,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
             else:
                 _, t_F_theta_B_C_T_H_W = self.student_F_withT((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_T, t_time_B_T), condition)
 
-        if self.net_fake_score and iteration > self.tangent_warmup:
-            G_time_B_T = math.pi / 2 * torch.ones_like(time_B_T)
-            G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-            G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-            G_xt_B_C_T_H_W = x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
-            G_xt_B_C_T_H_W = self.sync(G_xt_B_C_T_H_W)
-            num_simulation_steps_fake = self.get_effective_iteration(iteration) % self.max_simulation_steps_fake
-            for _ in range(num_simulation_steps_fake):
-                with torch.no_grad():
-                    G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
-                G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
-                G_time_B_T = self.sync(G_time_B_T)
-                G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-                G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-                G_xt_B_C_T_H_W = G_x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
-                G_xt_B_C_T_H_W = self.sync(G_xt_B_C_T_H_W)
-            all_xt_B_C_T_H_W = torch.cat([xt_B_C_T_H_W, G_xt_B_C_T_H_W], dim=0)
-            all_time_B_T = torch.cat([time_B_T, G_time_B_T], dim=0)
-            all_condition = concat_condition(condition, condition)
-            all_theta_B_C_T_H_W = self.denoise(all_xt_B_C_T_H_W, all_time_B_T, all_condition, net_type="student")
-            F_theta_B_C_T_H_W, _ = torch.chunk(all_theta_B_C_T_H_W.F, 2)
-            _, G_x0_theta_B_C_T_H_W = torch.chunk(all_theta_B_C_T_H_W.x0, 2)
-        else:
-            F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
+        F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
         F_theta_B_C_T_H_W_sg = F_theta_B_C_T_H_W.clone().detach()
 
         warmup_ratio = min(1.0, iteration / self.tangent_warmup)
@@ -628,45 +602,54 @@ class T2VDistillModel_rCM(ImaginaireModel):
         x0_teacher_B_C_T_H_W = cost_B_1_T_1_1 * xt_B_C_T_H_W - sint_B_1_T_1_1 * F_teacher_B_C_T_H_W
         x0_theta_B_C_T_H_W = cost_B_1_T_1_1 * xt_B_C_T_H_W - sint_B_1_T_1_1 * F_theta_B_C_T_H_W
         output_batch = {
-            "x0": x0_B_C_T_H_W,
-            "xt": xt_B_C_T_H_W,
-            "time": time_B_T,
+            "x0": x0_B_C_T_H_W.detach().cpu(),
+            "xt": xt_B_C_T_H_W.detach().cpu(),
+            "time": time_B_T.detach().cpu(),
             "condition": condition,
-            "df_dt": df_dt,
-            "nan_mask_g": nan_mask_g,
-            "nan_mask_F_theta": nan_mask_F_theta,
-            "teacher_pred": DenoisePrediction(x0_teacher_B_C_T_H_W, F_teacher_B_C_T_H_W),
-            "model_pred": DenoisePrediction(x0_theta_B_C_T_H_W, F_theta_B_C_T_H_W),
+            "df_dt": df_dt.detach().cpu(),
+            "nan_mask_g": nan_mask_g.detach().cpu(),
+            "nan_mask_F_theta": nan_mask_F_theta.detach().cpu(),
+            "teacher_pred": DenoisePrediction(x0_teacher_B_C_T_H_W.detach().cpu(), F_teacher_B_C_T_H_W.detach().cpu()),
+            "model_pred": DenoisePrediction(x0_theta_B_C_T_H_W.detach().cpu(), F_theta_B_C_T_H_W.detach().cpu()),
         }
+        return output_batch, kendall_loss
 
-        if self.net_fake_score and iteration > self.tangent_warmup:
-            D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
-            D_time_B_T = self.sync(D_time_B_T)
-            D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
-            D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * torch.cos(D_time_B_1_T_1_1) + torch.randn_like(x0_B_C_T_H_W) * torch.sin(D_time_B_1_T_1_1)
-            D_xt_theta_B_C_T_H_W = self.sync(D_xt_theta_B_C_T_H_W)
+    def _student_dmd_step(self, ctx, iteration):
+        log.debug(f"Student update {iteration} (DMD)")
+        x0_B_C_T_H_W, condition, uncondition = ctx
+        num_simulation_steps_fake = self.get_effective_iteration(iteration) % self.max_simulation_steps_fake + 1
+        G_x0_theta_B_C_T_H_W, _ = self.backward_simulation(condition, x0_B_C_T_H_W.size(), num_simulation_steps_fake, with_grad=True)
+        D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
+        epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
+        D_time_B_T, epsilon_B_C_T_H_W = self.sync(D_time_B_T, epsilon_B_C_T_H_W)
+        D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
+        D_xt_theta_B_C_T_H_W = torch.cos(D_time_B_1_T_1_1) * G_x0_theta_B_C_T_H_W + torch.sin(D_time_B_1_T_1_1) * epsilon_B_C_T_H_W
 
-            with torch.no_grad():
-                x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
-
-            with torch.no_grad():
-                x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="teacher").x0
-                if self.teacher_guidance > 0.0:
-                    x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, net_type="teacher").x0
-                    x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W + self.teacher_guidance * (
-                        x0_theta_teacher_B_C_T_H_W - x0_theta_teacher_B_C_T_H_W_uncond
-                    )
-            with torch.no_grad():
-                weight_factor = (
-                    torch.abs(G_x0_theta_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double())
-                    .mean(dim=[1, 2, 3, 4], keepdim=True)
-                    .clip(min=0.00001)
+        with torch.no_grad():
+            x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
+        with torch.no_grad():
+            x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="teacher").x0
+            if self.teacher_guidance > 0.0:
+                x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, net_type="teacher").x0
+                x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W + self.teacher_guidance * (
+                    x0_theta_teacher_B_C_T_H_W - x0_theta_teacher_B_C_T_H_W_uncond
                 )
-            grad_B_C_T_H_W = (x0_theta_fake_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double()) / weight_factor
-            loss_dmd = (G_x0_theta_B_C_T_H_W.double() - (G_x0_theta_B_C_T_H_W.double() - grad_B_C_T_H_W).detach()) ** 2
-            loss_dmd[torch.isnan(loss_dmd).flatten(start_dim=1).any(dim=1)] = 0
-            loss_dmd = loss_dmd.sum(dim=(1, 2, 3, 4))
-            kendall_loss += self.loss_scale_dmd * loss_dmd
+        with torch.no_grad():
+            weight_factor = (
+                torch.abs(G_x0_theta_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double()).mean(dim=[1, 2, 3, 4], keepdim=True).clip(min=0.00001)
+            )
+        grad_B_C_T_H_W = (x0_theta_fake_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double()) / weight_factor
+        loss_dmd = (G_x0_theta_B_C_T_H_W.double() - (G_x0_theta_B_C_T_H_W.double() - grad_B_C_T_H_W).detach()) ** 2
+        loss_dmd[torch.isnan(loss_dmd).flatten(start_dim=1).any(dim=1)] = 0
+        loss_dmd = loss_dmd.sum(dim=(1, 2, 3, 4))
+        kendall_loss = self.loss_scale_dmd * loss_dmd
+        output_batch = {
+            "G_x0": G_x0_theta_B_C_T_H_W.detach().cpu(),
+            "D_xt": D_xt_theta_B_C_T_H_W.detach().cpu(),
+            "D_time": D_time_B_T.detach().cpu(),
+            "x0_theta_fake": x0_theta_fake_B_C_T_H_W.detach().cpu(),
+            "x0_theta_teacher": x0_theta_teacher_B_C_T_H_W.detach().cpu(),
+        }
         return output_batch, kendall_loss
 
     def training_step_critic(
@@ -678,66 +661,49 @@ class T2VDistillModel_rCM(ImaginaireModel):
         x0_B_C_T_H_W, time_B_T, epsilon_B_C_T_H_W, condition, uncondition = self.sync(
             x0_B_C_T_H_W, time_B_T, epsilon_B_C_T_H_W, condition, uncondition
         )
-
-        G_time_B_T = math.pi / 2 * torch.ones_like(time_B_T)
-        G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-        G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-        G_xt_B_C_T_H_W = x0_B_C_T_H_W * G_cost_B_1_T_1_1 + epsilon_B_C_T_H_W * G_sint_B_1_T_1_1
-
-        num_simulation_steps_fake = self.get_effective_iteration_fake(iteration) % self.max_simulation_steps_fake
-        for _ in range(num_simulation_steps_fake):
-            with torch.no_grad():
-                G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
-            G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
-            G_time_B_T = self.sync(G_time_B_T)
-            G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-            G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-            G_xt_B_C_T_H_W = G_x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
-            G_xt_B_C_T_H_W = self.sync(G_xt_B_C_T_H_W)
-
-        with torch.no_grad():
-            G_x0_theta_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
+        num_simulation_steps_fake = self.get_effective_iteration_fake(iteration) % self.max_simulation_steps_fake + 1
+        G_x0_theta_B_C_T_H_W, _ = self.backward_simulation(condition, x0_B_C_T_H_W.size(), num_simulation_steps_fake, with_grad=False)
 
         D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
-        D_epsilon_B_C_T_H_W = torch.randn_like(x0_B_C_T_H_W)
+        D_epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
         D_time_B_T, D_epsilon_B_C_T_H_W = self.sync(D_time_B_T, D_epsilon_B_C_T_H_W)
         D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
         D_cost_B_1_T_1_1, D_sint_B_1_T_1_1 = torch.cos(D_time_B_1_T_1_1), torch.sin(D_time_B_1_T_1_1)
-        D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * D_cost_B_1_T_1_1 + D_epsilon_B_C_T_H_W * D_sint_B_1_T_1_1
+        D_xt_theta_B_C_T_H_W = D_cost_B_1_T_1_1 * G_x0_theta_B_C_T_H_W + D_sint_B_1_T_1_1 * D_epsilon_B_C_T_H_W
         x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
         kendall_loss = self.loss_scale_fake_score * ((G_x0_theta_B_C_T_H_W - x0_theta_fake_B_C_T_H_W) ** 2 / D_sint_B_1_T_1_1**2).sum(
             dim=(1, 2, 3, 4)
         )
         output_batch = {
-            "x0": x0_B_C_T_H_W,
-            "xt": G_xt_B_C_T_H_W,
-            "x0_pred": G_x0_theta_B_C_T_H_W,
+            "G_x0": G_x0_theta_B_C_T_H_W.detach().cpu(),
+            "D_xt": D_xt_theta_B_C_T_H_W.detach().cpu(),
+            "D_time": D_time_B_T.detach().cpu(),
+            "x0_theta_fake": x0_theta_fake_B_C_T_H_W.detach().cpu(),
         }
         return output_batch, kendall_loss
 
-    def training_step(self, data_batch: dict[str, torch.Tensor], iteration: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
+    def training_step_closures(self, data_batch, iteration: int):
         _, x0_B_C_T_H_W, condition, uncondition = self.get_data_and_condition(data_batch)
 
         if self.is_student_phase(iteration):
-            # update the student
             self.net.train().requires_grad_(True)
             if self.net_fake_score:
                 self.net_fake_score.eval().requires_grad_(False)
 
-            output_batch, kendall_loss = self.training_step_generator(x0_B_C_T_H_W, condition, uncondition, iteration)
+            ctx = self._make_student_ctx(x0_B_C_T_H_W, condition, uncondition, iteration)
+
+            if self.loss_scale > 0:
+                yield "scm", lambda: self._student_scm_step(ctx, iteration)
+
+            if self.net_fake_score and iteration > self.tangent_warmup and self.loss_scale_dmd > 0:
+                yield "dmd", lambda: self._student_dmd_step(ctx, iteration)
 
         else:
-            # update the fake_score
             self.net.eval().requires_grad_(False)
             if self.net_fake_score:
                 self.net_fake_score.train().requires_grad_(True)
 
-            output_batch, kendall_loss = self.training_step_critic(x0_B_C_T_H_W, condition, uncondition, iteration)
-
-        kendall_loss = kendall_loss.mean()
-
-        return output_batch, kendall_loss
+            yield "critic", lambda: self.training_step_critic(x0_B_C_T_H_W, condition, uncondition, iteration)
 
     @torch.no_grad()
     def forward(self, xt, t, condition: TextCondition):
@@ -1129,13 +1095,19 @@ class T2VDistillModel_rCM(ImaginaireModel):
         norm_type: float = 2.0,
         error_if_nonfinite: bool = False,
         foreach: Optional[bool] = None,
+        iteration: int = 0,
     ):
         if not self.grad_clip:
             max_norm = 1e12
+        if self.is_student_phase(iteration):
+            return clip_grad_norm_(
+                self.net.parameters(),
+                max_norm=max_norm,
+                norm_type=norm_type,
+                error_if_nonfinite=error_if_nonfinite,
+                foreach=foreach,
+            ).cpu()
         if self.net_fake_score:
-            for param in self.net_fake_score.parameters():
-                if param.grad is not None:
-                    torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
             clip_grad_norm_(
                 self.net_fake_score.parameters(),
                 max_norm=max_norm,
@@ -1143,13 +1115,4 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 error_if_nonfinite=error_if_nonfinite,
                 foreach=foreach,
             )
-        for param in self.net.parameters():
-            if param.grad is not None:
-                torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
-        return clip_grad_norm_(
-            self.net.parameters(),
-            max_norm=max_norm,
-            norm_type=norm_type,
-            error_if_nonfinite=error_if_nonfinite,
-            foreach=foreach,
-        ).cpu()
+        return None

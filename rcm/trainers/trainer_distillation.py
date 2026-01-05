@@ -233,7 +233,7 @@ class ImaginaireTrainer_Distill:
         self,
         model_ddp: torch.nn.Module | distributed.DistributedDataParallel,
         grad_scaler: torch.amp.GradScaler,
-        data: dict[str, torch.Tensor],
+        data_batch: dict[str, torch.Tensor],
         iteration: int = 0,
         grad_accum_iter: int = 0,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, int]:
@@ -242,10 +242,8 @@ class ImaginaireTrainer_Distill:
         Args:
             model_ddp (torch.nn.Module | distributed.DistributedDataParallel): The model with a DDP wrapper or, the bare
               module, depending on whether distributed training is enabled or not.
-            optimizer (torch.optim.Optimizer): The model optimizer.
-            scheduler (torch.optim.lr_scheduler.LRScheduler): The optimization scheduler.
             grad_scaler (torch.amp.GradScaler): The gradient scaler (for mixed precision training).
-            data (dict[str, torch.Tensor]): Data batch (dictionary of tensors).
+            data_batch (dict[str, torch.Tensor]): Data batch (dictionary of tensors).
             iteration (int): Current iteration number.
             grad_accum_iter (int): Number of gradient accumulation iterations.
 
@@ -257,32 +255,44 @@ class ImaginaireTrainer_Distill:
             model = model_ddp.module
         else:
             model = model_ddp
-        # Only let DDP sync gradient at the last iteration of the gradient accumulation window
-        with distributed.ddp_sync_grad(model_ddp, grad_accum_iter == self.config.trainer.grad_accum_iter - 1):
-            self.callbacks.on_before_forward(iteration=iteration)
-            with self.training_timer("forward"):
-                output_batch, loss = model_ddp.training_step(data, iteration)
-            self.callbacks.on_after_forward(iteration=iteration)
-            self.callbacks.on_before_backward(model_ddp, loss, iteration=iteration)
-            with self.training_timer("backward"):
-                loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
-                loss_scaled.backward()
-                model.on_after_backward()
-            self.callbacks.on_after_backward(model_ddp, iteration=iteration)
+        with self.training_timer(f"forward_init"):
+            closures = list(model_ddp.training_step_closures(data_batch, iteration))
+        is_last_accum = grad_accum_iter == self.config.trainer.grad_accum_iter - 1
+        output_batch = {}
+        loss_total = 0.0
+        for i, (name, closure) in enumerate(closures):
+            is_last_closure = i == len(closures) - 1
+            sync_this_backward = is_last_accum and is_last_closure  # only sync once
+
+            with distributed.ddp_sync_grad(model_ddp, sync_this_backward):
+                self.callbacks.on_before_forward(iteration=iteration)
+                with self.training_timer(f"forward:{name}"):
+                    out_i, loss_i = closure()  # loss_i must be scalar
+                self.callbacks.on_after_forward(iteration=iteration)
+
+                # IMPORTANT: don't return graph-tensors in out_i (detach them inside the model)
+                output_batch.update(out_i)
+
+                self.callbacks.on_before_backward(model_ddp, loss_i, iteration=iteration)
+                with self.training_timer(f"backward:{name}"):
+                    grad_scaler.scale(loss_i / self.config.trainer.grad_accum_iter).backward()
+                    model.on_after_backward()
+                self.callbacks.on_after_backward(model_ddp, iteration=iteration)
+
+            loss_total = loss_total + float(loss_i.detach())
+
+        loss = torch.tensor(loss_total, device="cuda")
         grad_accum_iter += 1
         if grad_accum_iter == self.config.trainer.grad_accum_iter:
             with self.training_timer("optimizer_step"):
-                self.callbacks.on_before_optimizer_step(
-                    model_ddp,
-                    model.optimizer_dict["net"],
-                    model.scheduler_dict["net"],
-                    grad_scaler,
-                    iteration=iteration,
-                )
-                model.optimizers_schedulers_step(grad_scaler, iteration=iteration)
-                self.callbacks.on_before_zero_grad(model_ddp, model.optimizer_dict["net"], model.scheduler_dict["net"], iteration=iteration)
-                model.on_before_zero_grad(model.optimizer_dict["net"], model.scheduler_dict["net"], iteration=iteration)
-                model.optimizers_zero_grad(iteration=iteration)
+                for optimizer, scheduler in zip(model.get_optimizers(iteration), model.get_lr_schedulers(iteration)):
+                    self.callbacks.on_before_optimizer_step(model_ddp, optimizer, scheduler, grad_scaler, iteration=iteration)
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                    scheduler.step()
+                    self.callbacks.on_before_zero_grad(model_ddp, optimizer, scheduler, iteration=iteration)
+                    model.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
+                    optimizer.zero_grad()
             grad_accum_iter = 0
         return output_batch, loss, grad_accum_iter
 
