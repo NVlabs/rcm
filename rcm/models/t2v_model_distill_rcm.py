@@ -573,9 +573,9 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         warmup_ratio = min(1.0, iteration / self.tangent_warmup)
 
-        g_B_C_T_H_W = -cost_B_1_T_1_1 * torch.sqrt(1 - warmup_ratio**2 * sint_B_1_T_1_1**2) * (
-            F_theta_B_C_T_H_W_sg - F_teacher_B_C_T_H_W
-        ) - warmup_ratio * (cost_B_1_T_1_1 * sint_B_1_T_1_1 * xt_B_C_T_H_W + t_F_theta_B_C_T_H_W)
+        g_B_C_T_H_W = -cost_B_1_T_1_1 * torch.sqrt(1 - warmup_ratio**2 * sint_B_1_T_1_1**2) * (F_theta_B_C_T_H_W_sg - F_teacher_B_C_T_H_W) - (
+            warmup_ratio * cost_B_1_T_1_1 * sint_B_1_T_1_1 * xt_B_C_T_H_W + t_F_theta_B_C_T_H_W
+        )
 
         with torch.no_grad():
             df_dt = -cost_B_1_T_1_1 * (F_theta_B_C_T_H_W_sg - F_teacher_B_C_T_H_W) - (sint_B_1_T_1_1 * xt_B_C_T_H_W + t_F_theta_B_C_T_H_W)
