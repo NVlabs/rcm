@@ -194,7 +194,7 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
                     weight_decay=0.01,
                     betas=(0.0, 0.999),
                 ),
-                tangent_warmup=1,
+                tangent_warmup=0,
                 teacher_ckpt="assets/checkpoints/Wan2.1-T2V-14B.dcp/model",
                 net=dict(
                     sac_config=dict(

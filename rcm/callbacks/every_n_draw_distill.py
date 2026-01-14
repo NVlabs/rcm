@@ -279,7 +279,7 @@ class EveryNDrawSample_Distill(EveryN):
 
         for prompt, text_emb in self.kv_prompt_to_emb.items():
             log.info(f"Generating with prompt: {prompt}")
-            data_batch[model.input_caption_key] = [prompt] * self.num_samples
+            data_batch[model.config.input_caption_key] = [prompt] * self.num_samples
             data_batch["t5_text_embeddings"] = repeat(text_emb.to(**model.tensor_kwargs), "b l d -> (k b) l d", k=self.num_samples)
 
             # generate samples
