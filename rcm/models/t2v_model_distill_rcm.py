@@ -504,7 +504,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
             with context_fn():
                 x_B_C_T_H_W = self.denoise(x_B_C_T_H_W, t_cur_B_1, condition, net_type="student").x0.float()
             if step < n_steps - 1:
-                x_B_C_T_H_W = math.cos(rearrange(t_next_B_1, "b t -> b 1 t 1 1")) * x_B_C_T_H_W + math.sin(
+                x_B_C_T_H_W = torch.cos(rearrange(t_next_B_1, "b t -> b 1 t 1 1")) * x_B_C_T_H_W + torch.sin(
                     rearrange(t_next_B_1, "b t -> b 1 t 1 1")
                 ) * self.sync(torch.randn_like(x_B_C_T_H_W))
             x_traj.append(x_B_C_T_H_W.detach())
