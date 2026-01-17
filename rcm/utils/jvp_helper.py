@@ -18,7 +18,6 @@ from typing import Any, Callable, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from einops import rearrange
 from torch import Tensor, nn
 
 from rcm.utils.a2a_cp import async_a2a_communicate
@@ -49,19 +48,15 @@ def torch_attention_op_withT(q_B_S_H_D_withT: TensorWithT, k_B_S_H_D_withT: Tens
     q_B_S_H_D, t_q_B_S_H_D = q_B_S_H_D_withT
     k_B_S_H_D, t_k_B_S_H_D = k_B_S_H_D_withT
     v_B_S_H_D, t_v_B_S_H_D = v_B_S_H_D_withT
-    in_q_shape = q_B_S_H_D.shape
-    in_k_shape = k_B_S_H_D.shape
-    q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
-    t_q_B_H_S_D = rearrange(t_q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
-    k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    t_k_B_H_S_D = rearrange(t_k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    t_v_B_H_S_D = rearrange(t_v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    result_B_H_S_D, t_result_B_H_S_D = _attention.apply(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, t_q_B_H_S_D, t_k_B_H_S_D, t_v_B_H_S_D)
-    result_B_S_H_D = rearrange(result_B_H_S_D, "b h ... l -> b ... h l")
-    t_result_B_S_H_D = rearrange(t_result_B_H_S_D, "b h ... l -> b ... h l")
-
-    return (result_B_S_H_D, t_result_B_S_H_D.detach())
+    result_B_H_S_D, t_result_B_H_S_D = _attention.apply(
+        q_B_S_H_D.transpose(1, 2),
+        k_B_S_H_D.transpose(1, 2),
+        v_B_S_H_D.transpose(1, 2),
+        t_q_B_S_H_D.transpose(1, 2),
+        t_k_B_S_H_D.transpose(1, 2),
+        t_v_B_S_H_D.transpose(1, 2),
+    )
+    return (result_B_H_S_D.transpose(1, 2), t_result_B_H_S_D.transpose(1, 2).detach())
 
 
 class _SeqAllToAllQKVWithT(torch.autograd.Function):
@@ -130,47 +125,26 @@ class MinimalA2AAttnOpWithT(torch.nn.Module):
     def forward(self, query_withT: TensorWithT, key_withT: TensorWithT, value_withT: TensorWithT, *args: Any, **kwargs) -> TensorWithT:
         del args, kwargs
         if self.pg is None:
-            output_B_S_H_D, t_output_B_S_H_D = self.local_attn_T(query_withT, key_withT, value_withT)
+            return self.local_attn_T(query_withT, key_withT, value_withT)
         else:
             pg_size = dist.get_world_size(self.pg)
             if pg_size < 2:
-                output_B_S_H_D, t_output_B_S_H_D = self.local_attn_T(query_withT, key_withT, value_withT)
+                return self.local_attn_T(query_withT, key_withT, value_withT)
             else:
                 query_B_S_H_D, t_query_B_S_H_D = query_withT
                 key_B_S_H_D, t_key_B_S_H_D = key_withT
                 value_B_S_H_D, t_value_B_S_H_D = value_withT
 
-                (
-                    query_B_S_H_D,
-                    t_query_B_S_H_D,
-                    key_B_S_H_D,
-                    t_key_B_S_H_D,
-                    value_B_S_H_D,
-                    t_value_B_S_H_D,
-                ) = _SeqAllToAllQKVWithT.apply(
-                    self.pg,
-                    query_B_S_H_D,
-                    t_query_B_S_H_D,
-                    key_B_S_H_D,
-                    t_key_B_S_H_D,
-                    value_B_S_H_D,
-                    t_value_B_S_H_D,
-                    pg_size,
-                    self.stream,
-                    True,
+                (query_B_S_H_D, t_query_B_S_H_D, key_B_S_H_D, t_key_B_S_H_D, value_B_S_H_D, t_value_B_S_H_D) = _SeqAllToAllQKVWithT.apply(
+                    self.pg, query_B_S_H_D, t_query_B_S_H_D, key_B_S_H_D, t_key_B_S_H_D, value_B_S_H_D, t_value_B_S_H_D, pg_size, self.stream, True
                 )
                 context_B_S_H_D, t_context_B_S_H_D = self.local_attn_T(
-                    tuple([query_B_S_H_D, t_query_B_S_H_D]),
-                    tuple([key_B_S_H_D, t_key_B_S_H_D]),
-                    tuple([value_B_S_H_D, t_value_B_S_H_D]),
+                    tuple([query_B_S_H_D, t_query_B_S_H_D]), tuple([key_B_S_H_D, t_key_B_S_H_D]), tuple([value_B_S_H_D, t_value_B_S_H_D])
                 )
                 output_B_S_H_D, t_output_B_S_H_D = _SeqAllToAllOutputWithT.apply(
                     self.pg, context_B_S_H_D, t_context_B_S_H_D, pg_size, self.stream, False
                 )
-        return (
-            rearrange(output_B_S_H_D, "b ... h l -> b ... (h l)"),
-            rearrange(t_output_B_S_H_D, "b ... h l -> b ... (h l)").detach(),
-        )
+                return output_B_S_H_D, t_output_B_S_H_D
 
     def set_context_parallel_group(self, process_group, ranks, stream):
         del ranks
@@ -208,18 +182,10 @@ def naive_scaled_dot_product_attention(
 
 
 def naive_attention_op(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D):
-    in_q_shape = q_B_S_H_D.shape
-    in_k_shape = k_B_S_H_D.shape
-    q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
-    k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    return rearrange(naive_scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D), "b h ... l -> b ... h l")
+    return naive_scaled_dot_product_attention(q_B_S_H_D.transpose(1, 2), k_B_S_H_D.transpose(1, 2), v_B_S_H_D.transpose(1, 2)).transpose(1, 2)
 
 
 def torch_attention_op(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D):
-    in_q_shape = q_B_S_H_D.shape
-    in_k_shape = k_B_S_H_D.shape
-    q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
-    k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    return rearrange(torch.nn.functional.scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D), "b h ... l -> b ... h l")
+    return torch.nn.functional.scaled_dot_product_attention(
+        q_B_S_H_D.transpose(1, 2), k_B_S_H_D.transpose(1, 2), v_B_S_H_D.transpose(1, 2)
+    ).transpose(1, 2)

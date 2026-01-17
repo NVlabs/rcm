@@ -382,7 +382,7 @@ class _attention(torch.autograd.Function):
                 causal=False,
             )
             dq, dk, dv = pad_fn(dq), pad_fn(dk), pad_fn(dv)
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 attention = _attention.apply
