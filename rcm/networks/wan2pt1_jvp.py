@@ -341,6 +341,7 @@ class WanSelfAttention(JVP):
 
     def set_context_parallel_group(self, process_group, ranks, stream):
         self.attn_op.set_context_parallel_group(process_group, ranks, stream)
+        self.attn_op_withT.set_context_parallel_group(process_group, ranks, stream)
 
 
 class WanT2VCrossAttention(WanSelfAttention):
