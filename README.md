@@ -91,7 +91,9 @@ See [Wan examples](Wan.md) for additional usage and I2V examples.
 ## Training
 In this repo, we provide training code based on Wan2.1 and its synthetic data.
 
-**Advanced training infrastructure—including FSDP2, Ulysses Context Parallel (CP), and Selective Activation Checkpointing (SAC)—is supported**. When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size, and note that the effective batch size is reduced by a factor of the CP size. **Our training code can also be readily adapted for pure DMD distillation** by disabling the sCM loss (setting `config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (e.g., TrigFlow timesteps $\frac{\pi}{2}\rightarrow 1.5\rightarrow 1.4\rightarrow1.0\rightarrow0.0$).
+**Advanced training infrastructure—including FSDP2, Ulysses Context Parallel (CP), and Selective Activation Checkpointing (SAC)—is supported**. When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size, and note that the effective batch size is reduced by a factor of the CP size. 
+
+**Our training code can also be readily adapted for pure DMD distillation** by disabling the sCM loss (setting `config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (e.g., TrigFlow timesteps $\frac{\pi}{2}\rightarrow 1.5\rightarrow 1.4\rightarrow1.0\rightarrow0.0$).
 
 #### Key Components
 - FlashAttention-2 JVP kernel: `rcm/utils/flash_attention_jvp_triton.py`
