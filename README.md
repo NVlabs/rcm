@@ -1,4 +1,4 @@
-<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model <br>🚀SOTA JVP-Based Diffusion Distillation & Few-Step Video Generation </h1>
+<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model <br>🚀SOTA JVP-Based Diffusion Distillation & Few-Step Video Generation & Scaling Up sCM/MeanFlow </h1>
 <div align="center">
   <div>
   <p align="center" style="font-size: larger;">
