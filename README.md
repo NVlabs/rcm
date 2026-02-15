@@ -19,11 +19,13 @@ rCM is the first work that:
 
 #### Comparison with Other Diffusion Distillation Methods on Wan2.1 T2V 1.3B (4-step)
 
-| sCM | DMD2 | rCM (Ours) |
-| --- | --- | --- |
-| <video src="https://github.com/user-attachments/assets/50693577-9a32-4b98-86ad-d4e1be4affdc" alt="sCM" controls></video> | <video src="https://github.com/user-attachments/assets/3f1ad494-9f13-4b2f-bf3e-b99ef98dbae4" alt="DMD2" controls></video> | <video src="https://github.com/user-attachments/assets/3da35a11-8ce6-4232-9aa2-6b3bc8b7cabf" alt="rCM" controls></video> |
+| teacher | DMD2 | SiD |
+| :---: | :---: | :---: |
+| <video src="https://github.com/user-attachments/assets/cdcd9fff-5ae9-4ba9-8864-4e1d733c1ce1" alt="teacher" controls></video> | <video src="https://github.com/user-attachments/assets/3f1ad494-9f13-4b2f-bf3e-b99ef98dbae4" alt="DMD2" controls></video> | <video src="https://github.com/user-attachments/assets/2cbd9f62-3d2a-4170-ad9a-a7f59d534ad3" alt="SiD" controls></video> |
+|**sCM**|**rCM (Ours)**||
+| <video src="https://github.com/user-attachments/assets/50693577-9a32-4b98-86ad-d4e1be4affdc" alt="sCM" controls></video> | <video src="https://github.com/user-attachments/assets/3da35a11-8ce6-4232-9aa2-6b3bc8b7cabf" alt="rCM" controls></video> | |
 
-rCM achieves both **high quality** and **exceptional diversity**.
+rCM achieves both **high quality** and **strong diversity**.
 
 #### Performance under Fewer (1~2) Steps
 
@@ -91,9 +93,9 @@ See [Wan examples](Wan.md) for additional usage and I2V examples.
 ## Training
 In this repo, we provide training code based on Wan2.1 and its synthetic data.
 
-**Advanced training infrastructure—including FSDP2, Ulysses Context Parallel (CP), and Selective Activation Checkpointing (SAC)—is supported**. When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size, and note that the effective batch size is reduced by a factor of the CP size. 
+**Advanced training infrastructure, including FSDP2, Ulysses Context Parallel (CP), and Selective Activation Checkpointing (SAC), is supported**. When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size, and note that the effective batch size is reduced by a factor of the CP size. 
 
-**Our training code can also be readily adapted for pure DMD distillation** by disabling the sCM loss (setting `config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (setting `config.dmd_fix_timesteps=True`).
+**Pure DMD distillation is also supported** by disabling the sCM loss (setting `config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (setting `config.dmd_fix_timesteps=True`).
 
 #### Key Components
 - FlashAttention-2 JVP kernel: `rcm/utils/flash_attention_jvp_triton.py`
@@ -159,8 +161,8 @@ Please refer to `rcm/configs/experiments/rcm/wan2pt1_t2v.py` for the 14B config 
 ## Future Directions
 
 There are promising directions to explore based on rCM. For example:
-- Few-step distilled models lag behind the teacher in aspects such as physical consistency; this can potentially be improved via reward-based post-training.
-- The forward–reverse divergence joint distillation framework of rCM could be extended to autoregressive video diffusion. 
+- The forward–reverse divergence joint distillation framework of rCM could be extended to **autoregressive video diffusion** by leveraging a *causal teacher*. 
+- Few-step distilled models lag behind the teacher in aspects such as physical consistency; this can potentially be improved via reinforcement learning.
 
 ## Acknowledgement
 We thank the [Cosmos-Predict2](https://github.com/nvidia-cosmos/cosmos-predict2) and [Cosmos-Predict2.5](https://github.com/nvidia-cosmos/cosmos-predict2.5) project for providing the awesome open-source video diffusion training codebase.
