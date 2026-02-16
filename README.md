@@ -161,7 +161,7 @@ Please refer to `rcm/configs/experiments/rcm/wan2pt1_t2v.py` for the 14B config 
 ## Future Directions
 
 There are promising directions to explore based on rCM. For example:
-- The forward–reverse divergence joint distillation framework of rCM could be extended to **autoregressive video diffusion** by leveraging a *causal teacher*. 
+- The forward–reverse divergence joint distillation framework of rCM could be extended to **autoregressive video diffusion** by leveraging a *causal teacher with teacher forcing* to complement self-forcing. 
 - Few-step distilled models lag behind the teacher in aspects such as physical consistency; this can potentially be improved via reinforcement learning.
 
 ## Acknowledgement
