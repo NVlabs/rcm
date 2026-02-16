@@ -19,7 +19,7 @@ import collections
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Literal
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Literal
 
 import attrs
 import numpy as np
@@ -104,7 +104,6 @@ class T2VDistillConfig_rCM:
     input_caption_key: str = "prompts"
     loss_scale: float = 100.0
     loss_scale_dmd: float = 1.0
-    loss_scale_fake_score: float = 1.0
     fd_type: int = 0  # finite difference type
     fd_size: float = 1e-4
     max_simulation_steps_fake: int = 4
@@ -298,7 +297,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
     def is_student_phase(self, iteration: int):
         return (
-            self.net_fake_score is None
+            (self.net_fake_score is None or self.config.loss_scale_dmd == 0)
             or iteration < self.config.tangent_warmup
             or (iteration - self.config.tangent_warmup) % self.config.student_update_freq == 0
         )
@@ -669,9 +668,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
         D_cost_B_1_T_1_1, D_sint_B_1_T_1_1 = torch.cos(D_time_B_1_T_1_1), torch.sin(D_time_B_1_T_1_1)
         D_xt_theta_B_C_T_H_W = D_cost_B_1_T_1_1 * G_x0_theta_B_C_T_H_W + D_sint_B_1_T_1_1 * D_epsilon_B_C_T_H_W
         x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
-        kendall_loss = self.config.loss_scale_fake_score * ((G_x0_theta_B_C_T_H_W - x0_theta_fake_B_C_T_H_W) ** 2 / D_sint_B_1_T_1_1**2).sum(
-            dim=(1, 2, 3, 4)
-        )
+        kendall_loss = ((G_x0_theta_B_C_T_H_W - x0_theta_fake_B_C_T_H_W) ** 2 / D_sint_B_1_T_1_1**2).sum(dim=(1, 2, 3, 4))
         output_batch = {
             "G_x0": G_x0_theta_B_C_T_H_W.detach().cpu(),
             "D_xt": D_xt_theta_B_C_T_H_W.detach().cpu(),
@@ -698,8 +695,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         else:
             self.net.eval().requires_grad_(False)
-            if self.net_fake_score:
-                self.net_fake_score.train().requires_grad_(True)
+            self.net_fake_score.train().requires_grad_(True)
 
             yield "critic", lambda: self.training_step_critic(x0_B_C_T_H_W, condition, uncondition, iteration)
 
