@@ -542,7 +542,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
             F_teacher_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="teacher").F
             if self.config.teacher_guidance > 0.0:
                 F_teacher_B_C_T_H_W_uncond = self.denoise(xt_B_C_T_H_W, time_B_T, uncondition, net_type="teacher").F
-                F_teacher_B_C_T_H_W = F_teacher_B_C_T_H_W + self.config.teacher_guidance * (F_teacher_B_C_T_H_W - F_teacher_B_C_T_H_W_uncond)
+                F_teacher_B_C_T_H_W = F_teacher_B_C_T_H_W_uncond + self.config.teacher_guidance * (F_teacher_B_C_T_H_W - F_teacher_B_C_T_H_W_uncond)
 
         # see Section 5.1 JVP rearrangement discussion https://arxiv.org/pdf/2410.11081
         t_xt_B_C_T_H_W = cost_B_1_T_1_1 * sint_B_1_T_1_1 * F_teacher_B_C_T_H_W
@@ -628,7 +628,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
             x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="teacher").x0
             if self.config.teacher_guidance > 0.0:
                 x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, net_type="teacher").x0
-                x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W + self.config.teacher_guidance * (
+                x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W_uncond + self.config.teacher_guidance * (
                     x0_theta_teacher_B_C_T_H_W - x0_theta_teacher_B_C_T_H_W_uncond
                 )
         with torch.no_grad():
