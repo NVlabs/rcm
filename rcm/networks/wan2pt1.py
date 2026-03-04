@@ -671,7 +671,7 @@ class WanModel(nn.Module):
         with amp.autocast("cuda", dtype=torch.float32):
             e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_B).float())
             e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
-            assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
+        assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
 
         # context
         context_lens = None

@@ -536,22 +536,25 @@ class WanAttentionBlock(JVP):
         assert e.dtype == torch.float32
         with amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
+            z = (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x)
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, freqs)
+        y = self.self_attn(z, seq_lens, freqs)
         with amp.autocast("cuda", dtype=torch.float32):
             x = (x + y * e[2]).type_as(x)
 
+        z = self.cross_attn(self.norm3(x), context, context_lens)
+
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
+        def cross_attn_ffn(x, z, e):
             with amp.autocast("cuda", dtype=torch.float32):
+                x = x + z
+                y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
                 x = (x + y * e[5]).type_as(x)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, z, e)
         return x
 
     def _forward_jvp(self, x: TensorWithT, e: TensorWithT, seq_lens, freqs, context, context_lens):
@@ -568,12 +571,12 @@ class WanAttentionBlock(JVP):
         assert e.dtype == torch.float32
 
         def pre_self_attn_fn(x, e):
-            e = (self.modulation + e).chunk(6, dim=1)
-            z = (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x)
+            with amp.autocast("cuda", dtype=torch.float32):
+                e = (self.modulation + e).chunk(6, dim=1)
+                z = (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x)
             return z, e
 
-        with amp.autocast("cuda", dtype=torch.float32):
-            (z, e), (t_z, t_e) = torch.func.jvp(pre_self_attn_fn, (x, e), (t_x, t_e))
+        (z, e), (t_z, t_e) = torch.func.jvp(pre_self_attn_fn, (x, e), (t_x, t_e))
 
         assert e[0].dtype == torch.float32
         z_withT, e_withT = (z, t_z.detach()), (e, tuple([_.detach() for _ in t_e]))
@@ -583,11 +586,11 @@ class WanAttentionBlock(JVP):
         y, t_y = y_withT
 
         def pre_cross_attn_fn(x, e2, y):
-            x = (x + y * e2).type_as(x)
+            with amp.autocast("cuda", dtype=torch.float32):
+                x = (x + y * e2).type_as(x)
             return x
 
-        with amp.autocast("cuda", dtype=torch.float32):
-            x, t_x = torch.func.jvp(pre_cross_attn_fn, (x, e[2], y), (t_x, t_e[2], t_y))
+        x, t_x = torch.func.jvp(pre_cross_attn_fn, (x, e[2], y), (t_x, t_e[2], t_y))
         t_x = t_x.detach()
 
         z, t_z = torch.func.jvp(self.norm3, (x,), (t_x,))
@@ -596,13 +599,13 @@ class WanAttentionBlock(JVP):
         z, t_z = z_withT
 
         def post_cross_attn_fn(x, z, e3, e4, e5):
-            x = x + z
-            y = self.ffn((self.norm2(x).float() * (1 + e4) + e3).type_as(x))
-            x = (x + y * e5).type_as(x)
+            with amp.autocast("cuda", dtype=torch.float32):
+                x = x + z
+                y = self.ffn((self.norm2(x).float() * (1 + e4) + e3).type_as(x))
+                x = (x + y * e5).type_as(x)
             return x
 
-        with amp.autocast("cuda", dtype=torch.float32):
-            x, t_x = torch.func.jvp(post_cross_attn_fn, (x, z, e[3], e[4], e[5]), (t_x, t_z, t_e[3], t_e[4], t_e[5]))
+        x, t_x = torch.func.jvp(post_cross_attn_fn, (x, z, e[3], e[4], e[5]), (t_x, t_z, t_e[3], t_e[4], t_e[5]))
         return (x, t_x.detach())
 
 
@@ -636,7 +639,6 @@ class Head(JVP):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
-        assert e.dtype == torch.float32
         with amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = self.head(self.norm(x) * (1 + e[1]) + e[0])
@@ -652,14 +654,9 @@ class Head(JVP):
         x, t_x = x_withT
         e, t_e = e_withT
         assert e.dtype == torch.float32
+        assert t_e.dtype == torch.float32
 
-        def fn(x, e):
-            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + e[1]) + e[0])
-            return x
-
-        with amp.autocast("cuda", dtype=torch.float32):
-            x, t_x = torch.func.jvp(fn, (x, e), (t_x, t_e))
+        x, t_x = torch.func.jvp(self._forward, (x, e), (t_x, t_e))
         return (x, t_x.detach())
 
 
@@ -667,6 +664,7 @@ class MLPProj(torch.nn.Module):
     def __init__(self, in_dim, out_dim, flf_pos_emb=False):
         super().__init__()
 
+        # BUG: mismatch with original Wan I2V; to be fixed
         self.proj = torch.nn.Sequential(WanLayerNorm(in_dim), nn.Linear(in_dim, in_dim), nn.GELU(), nn.Linear(in_dim, out_dim), WanLayerNorm(out_dim))
         if flf_pos_emb:  # NOTE: we only use this for `flf2v`
             self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
@@ -875,7 +873,7 @@ class WanModel_JVP(JVP):
         with amp.autocast("cuda", dtype=torch.float32):
             e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_B).float())
             e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
-            assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
+        assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
 
         # context
         context_lens = None
@@ -994,21 +992,19 @@ class WanModel_JVP(JVP):
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
 
         def time_embed_fn(t):
-            e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
+            with amp.autocast("cuda", dtype=torch.float32):
+                e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
+                e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
             return e_B_D, e0_B_6_D
 
         # time embeddings
-        with amp.autocast("cuda", dtype=torch.float32):
-            (e_B_D, e0_B_6_D), (t_e_B_D, t_e0_B_6_D) = torch.func.jvp(time_embed_fn, (t_B,), (t_t_B,))
-
+        (e_B_D, e0_B_6_D), (t_e_B_D, t_e0_B_6_D) = torch.func.jvp(time_embed_fn, (t_B,), (t_t_B,))
         assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
+        assert t_e_B_D.dtype == torch.float32 and t_e0_B_6_D.dtype == torch.float32
 
-        x_B_L_D_withT, e_B_D_withT, e0_B_6_D_withT = (
-            (x_B_L_D, t_x_B_L_D.detach()),
-            (e_B_D, t_e_B_D.detach()),
-            (e0_B_6_D, t_e0_B_6_D.detach()),
-        )
+        x_B_L_D_withT = (x_B_L_D, t_x_B_L_D.detach())
+        e_B_D_withT = (e_B_D, t_e_B_D.detach())
+        e0_B_6_D_withT = (e0_B_6_D, t_e0_B_6_D.detach())
 
         # context
         context_lens = None

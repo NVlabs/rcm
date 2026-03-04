@@ -15,7 +15,9 @@
 
 from hydra.core.config_store import ConfigStore
 
+from imaginaire.lazy_config import LazyCall as L
 from imaginaire.lazy_config import LazyDict
+from rcm.utils.timestep_utils import LogNormal, UniformShift
 
 
 def build_debug_run(job):
@@ -57,7 +59,7 @@ def build_debug_run(job):
 
 
 """
-torchrun --nproc_per_node=4 --master_port=12341 -m scripts.train --config=rcm/configs/registry.py -- experiment="wan2pt1_1pt3B_res480p_t2v_rCM_debug"
+torchrun --nproc_per_node=4 --master_port=12341 -m scripts.train --config=rcm/configs/registry_distill.py -- experiment="wan2pt1_1pt3B_res480p_t2v_rCM_debug"
 """
 WAN2PT1_1PT3B_RES480P_T2V: LazyDict = LazyDict(
     dict(
@@ -99,7 +101,8 @@ WAN2PT1_1PT3B_RES480P_T2V: LazyDict = LazyDict(
                 loss_scale_dmd=1.0,
                 fsdp_shard_size=4,
                 resolution="480p",
-                timestep_shift=5,
+                p_G=L(LogNormal)(p_mean=0.7, p_std=1.6),
+                p_D=L(UniformShift)(shift=5.0),
                 max_simulation_steps_fake=4,
                 state_t=20,
                 sigma_max=80,
@@ -187,7 +190,9 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
                     betas=(0.0, 0.999),
                 ),
                 tangent_warmup=0,
-                scm_timeshift=True,
+                sigma_max=200,
+                p_G=L(LogNormal)(p_mean=1.5, p_std=1.6),
+                p_D=L(UniformShift)(shift=5.0),
                 dmd_fix_timesteps=True,
                 teacher_ckpt="assets/checkpoints/Wan2.1-T2V-14B.dcp",
                 net=dict(

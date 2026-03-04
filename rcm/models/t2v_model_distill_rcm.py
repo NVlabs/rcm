@@ -45,7 +45,6 @@ from imaginaire.utils.easy_io import easy_io
 from imaginaire.utils.ema import FastEmaModelUpdater
 from rcm.conditioner import DataType, TextCondition
 from rcm.utils.optim_instantiate_dtensor import get_base_scheduler
-from rcm.utils.lognormal import LogNormal
 from rcm.utils.checkpointer import non_strict_load_model
 from rcm.utils.context_parallel import broadcast
 from rcm.utils.dtensor_helper import DTensorFastEmaModelUpdater, broadcast_dtensor_model_states
@@ -54,6 +53,7 @@ from rcm.utils.jvp_helper import TensorWithT
 from rcm.utils.misc import count_params
 from rcm.utils.torch_future import clip_grad_norm_
 from rcm.utils.denoiser_scaling import RectifiedFlow_TrigFlowWrapper
+from rcm.utils.timestep_utils import LogNormal, rf_to_trig_time
 from rcm.configs.defaults.ema import EMAConfig
 from rcm.samplers.euler import FlowEulerSampler
 from rcm.samplers.unipc import FlowUniPCMultistepSampler
@@ -87,14 +87,8 @@ class T2VDistillConfig_rCM:
 
     ema: EMAConfig = EMAConfig()
     checkpoint: ObjectStoreConfig = ObjectStoreConfig()
-    p_G: LazyDict = L(LogNormal)(
-        p_mean=-0.8,
-        p_std=1.6,
-    )
-    p_D: LazyDict = L(LogNormal)(
-        p_mean=0.0,
-        p_std=1.6,
-    )
+    p_G: LazyDict = L(LogNormal)(p_mean=-0.8, p_std=1.6)
+    p_D: LazyDict = L(LogNormal)(p_mean=0.0, p_std=1.6)
     student_update_freq: int = 5
     fsdp_shard_size: int = 1
     sigma_data: float = 1.0
@@ -108,9 +102,6 @@ class T2VDistillConfig_rCM:
     fd_size: float = 1e-4
     max_simulation_steps_fake: int = 4
     neg_embed_path: str = ""
-    timestep_shift: float = 5
-
-    adjust_video_noise: bool = True  # whether or not adjust video noise accroding to the video length
 
     state_ch: int = 16
     state_t: int = 21  # Number of latent frames
@@ -122,7 +113,6 @@ class T2VDistillConfig_rCM:
 
     backward_timesteps: list = [1.5, 1.4, 1.0]  # TrigFlow time
     dmd_fix_timesteps: bool = False
-    scm_timeshift: bool = False
 
 
 class T2VDistillModel_rCM(ImaginaireModel):
@@ -148,11 +138,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
             self.neg_embed = easy_io.load(config.neg_embed_path)
         else:
             self.neg_embed = None
-
-        if config.adjust_video_noise:
-            self.video_noise_multiplier = math.sqrt(config.state_t)
-        else:
-            self.video_noise_multiplier = 1.0
 
         # 2. tokenizer
         with misc.timer("DiffusionModel: set_up_tokenizer"):
@@ -363,37 +348,18 @@ class T2VDistillModel_rCM(ImaginaireModel):
         else:
             return [self.scheduler_dict["fake_score"]]
 
-    def draw_training_time_G(self, x0_size: int, condition: Any) -> torch.Tensor:
-        batch_size = x0_size[0]
-        if self.config.scm_timeshift and self.config.timestep_shift > 0:
-            sigma_B = torch.rand(batch_size).to(device="cuda").double()
-            sigma_B = self.config.timestep_shift * sigma_B / (1 + (self.config.timestep_shift - 1) * sigma_B)
-            sigma_B_1 = rearrange(sigma_B, "b -> b 1")
-            time_B_1 = torch.arctan(sigma_B_1 / (1 - sigma_B_1))
-            return time_B_1
-        sigma_B = self.p_G(batch_size).to(device="cuda")
-        sigma_B_1 = rearrange(sigma_B, "b -> b 1")  # add a dimension for T, all frames share the same sigma
-        is_video_batch = condition.data_type == DataType.VIDEO
-        multiplier = self.video_noise_multiplier if is_video_batch else 1
-        sigma_B_1 = sigma_B_1 * multiplier
-        time_B_1 = torch.arctan(sigma_B_1)
-        return time_B_1.double()
+    def _sample_rf_time(self, sampler, time_shape: Any) -> torch.Tensor:
+        assert isinstance(time_shape, (int, tuple, list, torch.Size)), f"Unsupported time shape type: {type(time_shape)}"
+        sampled = sampler(shape=time_shape, device="cuda", dtype=torch.float64)
+        domain = getattr(sampler, "output_domain", "rf")
+        assert domain == "rf", f"Expected RF-domain timestep sampler, got {domain}"
+        return sampled.clamp(min=0.0, max=1.0)
 
-    def draw_training_time_D(self, x0_size: int, condition: Any) -> torch.Tensor:
-        batch_size = x0_size[0]
-        if self.config.timestep_shift > 0:
-            sigma_B = torch.rand(batch_size).to(device="cuda").double()
-            sigma_B = self.config.timestep_shift * sigma_B / (1 + (self.config.timestep_shift - 1) * sigma_B)
-            sigma_B_1 = rearrange(sigma_B, "b -> b 1")
-            time_B_1 = torch.arctan(sigma_B_1 / (1 - sigma_B_1))
-            return time_B_1
-        sigma_B = self.p_D(batch_size).to(device="cuda")
-        sigma_B_1 = rearrange(sigma_B, "b -> b 1")  # add a dimension for T, all frames share the same sigma
-        is_video_batch = condition.data_type == DataType.VIDEO
-        multiplier = self.video_noise_multiplier if is_video_batch else 1
-        sigma_B_1 = sigma_B_1 * multiplier
-        time_B_1 = torch.arctan(sigma_B_1)
-        return time_B_1.double()
+    def draw_training_time_G(self, time_shape: Any) -> torch.Tensor:
+        return rf_to_trig_time(self._sample_rf_time(self.p_G, time_shape))
+
+    def draw_training_time_D(self, time_shape: Any) -> torch.Tensor:
+        return rf_to_trig_time(self._sample_rf_time(self.p_D, time_shape))
 
     def denoise(
         self,
@@ -508,7 +474,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
         t_traj, x_traj = [G_time_B_1], [x_B_C_T_H_W]
         for i in range(n_steps - 1):
             if not self.config.dmd_fix_timesteps:
-                G_time_B_1 = torch.minimum(self.draw_training_time_D(x_B_C_T_H_W_size, condition), G_time_B_1)
+                G_time_B_1 = torch.minimum(self.draw_training_time_D((x_B_C_T_H_W_size[0], 1)), G_time_B_1)
                 G_time_B_1 = self.sync(G_time_B_1)
                 t_traj.append(G_time_B_1)
             else:
@@ -521,8 +487,8 @@ class T2VDistillModel_rCM(ImaginaireModel):
             with context_fn():
                 x_B_C_T_H_W = self.denoise(x_B_C_T_H_W, t_cur_B_1, condition, net_type="student").x0.float()
             if step < n_steps - 1:
-                x_B_C_T_H_W = torch.cos(rearrange(t_next_B_1, "b t -> b 1 t 1 1")) * x_B_C_T_H_W + torch.sin(
-                    rearrange(t_next_B_1, "b t -> b 1 t 1 1")
+                x_B_C_T_H_W = torch.cos(rearrange(t_next_B_1, "b 1 -> b 1 1 1 1")) * x_B_C_T_H_W + torch.sin(
+                    rearrange(t_next_B_1, "b 1 -> b 1 1 1 1")
                 ) * self.sync(torch.randn_like(x_B_C_T_H_W))
             x_traj.append(x_B_C_T_H_W.detach())
         return x_B_C_T_H_W, (t_traj, x_traj)
@@ -534,51 +500,51 @@ class T2VDistillModel_rCM(ImaginaireModel):
     def _student_scm_step(self, ctx, iteration):
         log.debug(f"Student update {iteration} (sCM)")
         x0_B_C_T_H_W, condition, uncondition = ctx
-        time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
+        time_B_1 = self.draw_training_time_G((x0_B_C_T_H_W.shape[0], 1))
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
-        time_B_T, epsilon_B_C_T_H_W = self.sync(time_B_T, epsilon_B_C_T_H_W)
+        time_B_1, epsilon_B_C_T_H_W = self.sync(time_B_1, epsilon_B_C_T_H_W)
 
-        time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
-        cost_B_1_T_1_1, sint_B_1_T_1_1 = torch.cos(time_B_1_T_1_1), torch.sin(time_B_1_T_1_1)
-        xt_B_C_T_H_W = x0_B_C_T_H_W * cost_B_1_T_1_1 + epsilon_B_C_T_H_W * sint_B_1_T_1_1
+        time_B_1_1_1_1 = rearrange(time_B_1, "b t -> b 1 t 1 1")
+        cost_B_1_1_1_1, sint_B_1_1_1_1 = torch.cos(time_B_1_1_1_1), torch.sin(time_B_1_1_1_1)
+        xt_B_C_T_H_W = x0_B_C_T_H_W * cost_B_1_1_1_1 + epsilon_B_C_T_H_W * sint_B_1_1_1_1
         with torch.no_grad():
-            F_teacher_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="teacher").F
+            F_teacher_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_1, condition, net_type="teacher").F
             if self.config.teacher_guidance > 1.0:
-                F_teacher_B_C_T_H_W_uncond = self.denoise(xt_B_C_T_H_W, time_B_T, uncondition, net_type="teacher").F
+                F_teacher_B_C_T_H_W_uncond = self.denoise(xt_B_C_T_H_W, time_B_1, uncondition, net_type="teacher").F
                 F_teacher_B_C_T_H_W = F_teacher_B_C_T_H_W_uncond + self.config.teacher_guidance * (F_teacher_B_C_T_H_W - F_teacher_B_C_T_H_W_uncond)
 
         # see Section 5.1 JVP rearrangement discussion https://arxiv.org/pdf/2410.11081
-        t_xt_B_C_T_H_W = cost_B_1_T_1_1 * sint_B_1_T_1_1 * F_teacher_B_C_T_H_W
-        t_time_B_T = (cost_B_1_T_1_1 * sint_B_1_T_1_1).squeeze(dim=[1, 3, 4])
+        t_xt_B_C_T_H_W = cost_B_1_1_1_1 * sint_B_1_1_1_1 * F_teacher_B_C_T_H_W
+        t_time_B_1 = (cost_B_1_1_1_1 * sint_B_1_1_1_1).squeeze(dim=[1, 3, 4])
 
         with torch.no_grad():
             if self.config.fd_type == 1:  # semi-continuous
-                _, t_F_theta_B_C_T_H_W = self.student_F_withT((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_T, 0 * t_time_B_T), condition)
+                _, t_F_theta_B_C_T_H_W = self.student_F_withT((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_1, 0 * t_time_B_1), condition)
                 h = self.config.fd_size
-                F_theta_B_C_T_H_W_n1 = self.denoise(xt_B_C_T_H_W, time_B_T - h, condition, net_type="student").F
+                F_theta_B_C_T_H_W_n1 = self.denoise(xt_B_C_T_H_W, time_B_1 - h, condition, net_type="student").F
                 pF_pt_B_C_T_H_W = (np.cos(h) * _ - F_theta_B_C_T_H_W_n1) / np.sin(h)
-                t_F_theta_B_C_T_H_W += cost_B_1_T_1_1 * sint_B_1_T_1_1 * pF_pt_B_C_T_H_W
+                t_F_theta_B_C_T_H_W += cost_B_1_1_1_1 * sint_B_1_1_1_1 * pF_pt_B_C_T_H_W
             elif self.config.fd_type == 2:  # discrete
                 h = self.config.fd_size
-                _ = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
+                _ = self.denoise(xt_B_C_T_H_W, time_B_1, condition, net_type="student").F
                 xt2_B_C_T_H_W = np.cos(h) * xt_B_C_T_H_W - np.sin(h) * F_teacher_B_C_T_H_W
-                _2 = self.denoise(xt2_B_C_T_H_W, time_B_T - h, condition, net_type="student").F
+                _2 = self.denoise(xt2_B_C_T_H_W, time_B_1 - h, condition, net_type="student").F
                 dF_pt_B_C_T_H_W = (np.cos(h) * _ - _2) / np.sin(h)
-                t_F_theta_B_C_T_H_W = cost_B_1_T_1_1 * sint_B_1_T_1_1 * dF_pt_B_C_T_H_W
+                t_F_theta_B_C_T_H_W = cost_B_1_1_1_1 * sint_B_1_1_1_1 * dF_pt_B_C_T_H_W
             else:
-                _, t_F_theta_B_C_T_H_W = self.student_F_withT((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_T, t_time_B_T), condition)
+                _, t_F_theta_B_C_T_H_W = self.student_F_withT((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_1, t_time_B_1), condition)
 
-        F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
+        F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_1, condition, net_type="student").F
         F_theta_B_C_T_H_W_sg = F_theta_B_C_T_H_W.clone().detach()
 
-        warmup_ratio = min(1.0, iteration / self.config.tangent_warmup)
+        warmup_ratio = 1.0 if self.config.tangent_warmup == 0 else min(1.0, iteration / self.config.tangent_warmup)
 
-        g_B_C_T_H_W = -cost_B_1_T_1_1 * torch.sqrt(1 - warmup_ratio**2 * sint_B_1_T_1_1**2) * (F_theta_B_C_T_H_W_sg - F_teacher_B_C_T_H_W) - (
-            warmup_ratio * cost_B_1_T_1_1 * sint_B_1_T_1_1 * xt_B_C_T_H_W + t_F_theta_B_C_T_H_W
+        g_B_C_T_H_W = -cost_B_1_1_1_1 * torch.sqrt(1 - warmup_ratio**2 * sint_B_1_1_1_1**2) * (F_theta_B_C_T_H_W_sg - F_teacher_B_C_T_H_W) - (
+            warmup_ratio * cost_B_1_1_1_1 * sint_B_1_1_1_1 * xt_B_C_T_H_W + t_F_theta_B_C_T_H_W
         )
 
         with torch.no_grad():
-            df_dt = -cost_B_1_T_1_1 * (F_theta_B_C_T_H_W_sg - F_teacher_B_C_T_H_W) - (sint_B_1_T_1_1 * xt_B_C_T_H_W + t_F_theta_B_C_T_H_W)
+            df_dt = -cost_B_1_1_1_1 * (F_theta_B_C_T_H_W_sg - F_teacher_B_C_T_H_W) - (sint_B_1_1_1_1 * xt_B_C_T_H_W + t_F_theta_B_C_T_H_W)
             nan_mask_g = torch.isnan(g_B_C_T_H_W).flatten(start_dim=1).any(dim=1).view(*g_B_C_T_H_W.shape[:1], 1, 1, 1, 1).expand_as(g_B_C_T_H_W)
             nan_mask_F_theta = (
                 torch.isnan(F_theta_B_C_T_H_W)
@@ -599,12 +565,12 @@ class T2VDistillModel_rCM(ImaginaireModel):
         loss_scm = ((F_theta_B_C_T_H_W - F_theta_B_C_T_H_W_sg - g_B_C_T_H_W) ** 2).sum(dim=(1, 2, 3, 4))
         kendall_loss = self.config.loss_scale * loss_scm
 
-        x0_teacher_B_C_T_H_W = cost_B_1_T_1_1 * xt_B_C_T_H_W - sint_B_1_T_1_1 * F_teacher_B_C_T_H_W
-        x0_theta_B_C_T_H_W = cost_B_1_T_1_1 * xt_B_C_T_H_W - sint_B_1_T_1_1 * F_theta_B_C_T_H_W
+        x0_teacher_B_C_T_H_W = cost_B_1_1_1_1 * xt_B_C_T_H_W - sint_B_1_1_1_1 * F_teacher_B_C_T_H_W
+        x0_theta_B_C_T_H_W = cost_B_1_1_1_1 * xt_B_C_T_H_W - sint_B_1_1_1_1 * F_theta_B_C_T_H_W
         output_batch = {
             "x0": x0_B_C_T_H_W.detach().cpu(),
             "xt": xt_B_C_T_H_W.detach().cpu(),
-            "time": time_B_T.detach().cpu(),
+            "time": time_B_1.detach().cpu(),
             "condition": condition,
             "df_dt": df_dt.detach().cpu(),
             "nan_mask_g": nan_mask_g.detach().cpu(),
@@ -619,18 +585,18 @@ class T2VDistillModel_rCM(ImaginaireModel):
         x0_B_C_T_H_W, condition, uncondition = ctx
         num_simulation_steps_fake = self.get_effective_iteration(iteration) % self.config.max_simulation_steps_fake + 1
         G_x0_theta_B_C_T_H_W, _ = self.backward_simulation(condition, x0_B_C_T_H_W.size(), num_simulation_steps_fake, with_grad=True)
-        D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
+        D_time_B_1 = self.draw_training_time_D((x0_B_C_T_H_W.shape[0], 1))
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
-        D_time_B_T, epsilon_B_C_T_H_W = self.sync(D_time_B_T, epsilon_B_C_T_H_W)
-        D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
-        D_xt_theta_B_C_T_H_W = torch.cos(D_time_B_1_T_1_1) * G_x0_theta_B_C_T_H_W + torch.sin(D_time_B_1_T_1_1) * epsilon_B_C_T_H_W
+        D_time_B_1, epsilon_B_C_T_H_W = self.sync(D_time_B_1, epsilon_B_C_T_H_W)
+        D_time_B_1_1_1_1 = rearrange(D_time_B_1, "b t -> b 1 t 1 1")
+        D_xt_theta_B_C_T_H_W = torch.cos(D_time_B_1_1_1_1) * G_x0_theta_B_C_T_H_W + torch.sin(D_time_B_1_1_1_1) * epsilon_B_C_T_H_W
 
         with torch.no_grad():
-            x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
+            x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_1, condition, net_type="fake_score").x0
         with torch.no_grad():
-            x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="teacher").x0
+            x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_1, condition, net_type="teacher").x0
             if self.config.teacher_guidance > 1.0:
-                x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, net_type="teacher").x0
+                x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_1, uncondition, net_type="teacher").x0
                 x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W_uncond + self.config.teacher_guidance * (
                     x0_theta_teacher_B_C_T_H_W - x0_theta_teacher_B_C_T_H_W_uncond
                 )
@@ -646,7 +612,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
         output_batch = {
             "G_x0": G_x0_theta_B_C_T_H_W.detach().cpu(),
             "D_xt": D_xt_theta_B_C_T_H_W.detach().cpu(),
-            "D_time": D_time_B_T.detach().cpu(),
+            "D_time": D_time_B_1.detach().cpu(),
             "x0_theta_fake": x0_theta_fake_B_C_T_H_W.detach().cpu(),
             "x0_theta_teacher": x0_theta_teacher_B_C_T_H_W.detach().cpu(),
         }
@@ -658,18 +624,18 @@ class T2VDistillModel_rCM(ImaginaireModel):
         num_simulation_steps_fake = self.get_effective_iteration_fake(iteration) % self.config.max_simulation_steps_fake + 1
         G_x0_theta_B_C_T_H_W, _ = self.backward_simulation(condition, x0_B_C_T_H_W.size(), num_simulation_steps_fake, with_grad=False)
 
-        D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
+        D_time_B_1 = self.draw_training_time_D((x0_B_C_T_H_W.shape[0], 1))
         D_epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
-        D_time_B_T, D_epsilon_B_C_T_H_W = self.sync(D_time_B_T, D_epsilon_B_C_T_H_W)
-        D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
-        D_cost_B_1_T_1_1, D_sint_B_1_T_1_1 = torch.cos(D_time_B_1_T_1_1), torch.sin(D_time_B_1_T_1_1)
-        D_xt_theta_B_C_T_H_W = D_cost_B_1_T_1_1 * G_x0_theta_B_C_T_H_W + D_sint_B_1_T_1_1 * D_epsilon_B_C_T_H_W
-        x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
-        kendall_loss = ((G_x0_theta_B_C_T_H_W - x0_theta_fake_B_C_T_H_W) ** 2 / D_sint_B_1_T_1_1**2).sum(dim=(1, 2, 3, 4))
+        D_time_B_1, D_epsilon_B_C_T_H_W = self.sync(D_time_B_1, D_epsilon_B_C_T_H_W)
+        D_time_B_1_1_1_1 = rearrange(D_time_B_1, "b t -> b 1 t 1 1")
+        D_cost_B_1_1_1_1, D_sint_B_1_1_1_1 = torch.cos(D_time_B_1_1_1_1), torch.sin(D_time_B_1_1_1_1)
+        D_xt_theta_B_C_T_H_W = D_cost_B_1_1_1_1 * G_x0_theta_B_C_T_H_W + D_sint_B_1_1_1_1 * D_epsilon_B_C_T_H_W
+        x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_1, condition, net_type="fake_score").x0
+        kendall_loss = ((G_x0_theta_B_C_T_H_W - x0_theta_fake_B_C_T_H_W) ** 2 / D_sint_B_1_1_1_1**2).sum(dim=(1, 2, 3, 4))
         output_batch = {
             "G_x0": G_x0_theta_B_C_T_H_W.detach().cpu(),
             "D_xt": D_xt_theta_B_C_T_H_W.detach().cpu(),
-            "D_time": D_time_B_T.detach().cpu(),
+            "D_time": D_time_B_1.detach().cpu(),
             "x0_theta_fake": x0_theta_fake_B_C_T_H_W.detach().cpu(),
         }
         return output_batch, kendall_loss
