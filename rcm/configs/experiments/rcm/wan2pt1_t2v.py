@@ -193,7 +193,6 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
                 sigma_max=200,
                 p_G=L(LogNormal)(p_mean=1.5, p_std=1.6),
                 p_D=L(UniformShift)(shift=5.0),
-                dmd_fix_timesteps=True,
                 teacher_ckpt="assets/checkpoints/Wan2.1-T2V-14B.dcp",
                 net=dict(
                     sac_config=dict(
