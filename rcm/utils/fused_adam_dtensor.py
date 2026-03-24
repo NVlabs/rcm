@@ -188,38 +188,40 @@ class FusedAdam(torch.optim.Optimizer):
                 if p.grad.data.is_sparse:
                     raise RuntimeError("FusedAdam does not support sparse gradients, please consider SparseAdam instead")
 
+                local_p = get_local_tensor_if_DTensor(p)
+                local_g = get_local_tensor_if_DTensor(p.grad)
+                # Composable FSDP can leave some original parameters without a local slice on a rank.
+                # Those zero-sized shards should not be handed to TE's fused multi-tensor kernels.
+                if local_p.numel() == 0 or local_g.numel() == 0:
+                    continue
+
                 state = self.state[p]
                 # State initialization
                 if len(state) == 0:
                     # Exponential moving average of gradient values
-                    # Change that makes .step() not crash
-                    state["exp_avg"] = torch.zeros_like(get_local_tensor_if_DTensor(p).data, dtype=torch.float32)
+                    state["exp_avg"] = torch.zeros_like(local_p.data, dtype=torch.float32)
                     # Exponential moving average of squared gradient values
-                    # Change that makes .step() not crash
-                    state["exp_avg_sq"] = torch.zeros_like(get_local_tensor_if_DTensor(p).data, dtype=torch.float32)
+                    state["exp_avg_sq"] = torch.zeros_like(local_p.data, dtype=torch.float32)
 
                 if p.dtype == torch.float16:
                     if self.master_weights:
                         p_16_master.append(get_local_tensor_if_DTensor(p_master).data)
-                    g_16.append(get_local_tensor_if_DTensor(p.grad))
-                    p_16.append(get_local_tensor_if_DTensor(p))
+                    g_16.append(local_g)
+                    p_16.append(local_p)
                     m_16.append(state["exp_avg"])
                     v_16.append(state["exp_avg_sq"])
                 elif p.dtype == torch.bfloat16:
                     if self.master_weights:
-                        # Change that makes .step() not crash
                         bf16_master.append(get_local_tensor_if_DTensor(p_master).data)
-                    # Change that makes .step() not crash
-                    g_bf.append(get_local_tensor_if_DTensor(p.grad))
-                    # Change that makes .step() not crash
-                    p_bf.append(get_local_tensor_if_DTensor(p))
+                    g_bf.append(local_g)
+                    p_bf.append(local_p)
                     m_bf.append(state["exp_avg"])
                     v_bf.append(state["exp_avg_sq"])
                 elif p.dtype == torch.float32:
                     if self.master_weights:
-                        p_32_master.append(p_master.data)
-                    g_32.append(p.grad.data)
-                    p_32.append(p.data)
+                        p_32_master.append(get_local_tensor_if_DTensor(p_master).data)
+                    g_32.append(local_g.data)
+                    p_32.append(local_p.data)
                     m_32.append(state["exp_avg"])
                     v_32.append(state["exp_avg_sq"])
                 else:

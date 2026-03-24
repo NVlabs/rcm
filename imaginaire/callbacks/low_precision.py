@@ -28,7 +28,10 @@ def update_master_weights(optimizer: torch.optim.Optimizer):
         params, master_params = [], []
         for group, group_master in zip(optimizer.param_groups, optimizer.param_groups_master):
             for p, p_master in zip(group["params"], group_master["params"]):
-                params.append(get_local_tensor_if_DTensor(p.data))
+                local_param = get_local_tensor_if_DTensor(p.data)
+                if local_param.numel() == 0:
+                    continue
+                params.append(local_param)
                 master_params.append(p_master.data)
         torch._foreach_copy_(params, master_params)
 
