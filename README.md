@@ -96,8 +96,9 @@ In this repo, we provide training code based on Wan2.1 and its synthetic data.
 **Advanced training infrastructure, including FSDP2, Ulysses Context Parallel (CP), and Selective Activation Checkpointing (SAC), is supported**. When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size, and note that the effective batch size is reduced by a factor of the CP size. 
 
 Our training code also support:
-- **Pure DMD distillation** by disabling the sCM loss (setting `model.config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (setting `model.config.dmd_fix_timesteps=True`).
+- **Pure DMD distillation (JVP-free)** by disabling the sCM loss (setting `model.config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (setting `model.config.dmd_fix_timesteps=True`).
 - **Pure sCM distillation** by setting `model.config.net_fake_score=null` or `model.config.loss_scale_dmd=0`.
+- **Discrete-time CM (JVP-free)** by setting `model.config.cm_type=dcm`.
 
 #### Key Components
 - FlashAttention-2 JVP kernel: `rcm/utils/flash_attention_jvp_triton.py`
