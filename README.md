@@ -9,6 +9,8 @@
   <a href='https://research.nvidia.com/labs/dir/rcm'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
+**Notice**: rCM will soon support **causal training**, unlocking how *teacher-forcing* (forward-divergence) CM can supplement *self-forcing* (reverse-divergence) DMD in autoregressive video diffusion distillation!
+
 ## Overview
 
 rCM is the first work that:
