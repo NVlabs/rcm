@@ -9,14 +9,14 @@
   <a href='https://research.nvidia.com/labs/dir/rcm'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
-**Notice**: rCM will soon support **causal training**, unlocking how *teacher-forcing* (forward-divergence) CM can supplement *self-forcing* (reverse-divergence) DMD in autoregressive video diffusion distillation!
+**Notice**: rCM will soon support **causal training**, unlocking how *teacher-forcing* (forward-divergence) CM complements *self-forcing* (reverse-divergence) DMD in autoregressive video diffusion distillation!
 
 ## Overview
 
 rCM is the first work that:
 - Scales up **continuous-time consistency distillation (e.g., sCM/MeanFlow)** to 10B+ parameter video diffusion models.
 - Provides open-sourced **FlashAttention-2 Jacobian-vector product (JVP) kernel** with support for parallelisms like FSDP/CP.
-- Identifies the quality bottleneck of sCM and overcomes it via a **forward–reverse divergence joint distillation** framework.
+- Identifies the quality bottleneck of sCM and overcomes it via a **forward–reverse divergence joint distillation** framework, showcasing how CM (forward-divergence method) can complement DMD (reverse-KL method) in enhancing diversity.
 - Delivers models that generate videos with both **high quality and strong diversity in only 2~4 steps**.
 
 #### Comparison with Other Diffusion Distillation Methods on Wan2.1 T2V 1.3B (4-step)
@@ -58,6 +58,10 @@ git clone https://github.com/Dao-AILab/flash-attention.git
 cd flash-attention
 git checkout v2.7.4.post1
 MAX_JOBS=4 python setup.py install
+# (Optional) flash attention 3 (2x speed on Hopper)
+git checkout main
+cd hopper
+MAX_JOBS=4 python setup.py install
 ```
 
 ## Inference
@@ -95,11 +99,15 @@ See [Wan examples](Wan.md) for additional usage and I2V examples.
 ## Training
 In this repo, we provide training code based on Wan2.1 and its synthetic data.
 
-**Advanced training infrastructure, including FSDP2, Ulysses Context Parallel (CP), and Selective Activation Checkpointing (SAC), is supported**. When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size, and note that the effective batch size is reduced by a factor of the CP size. 
+Advanced training infrastructure supported:
+- **FSDP2**. Adjust by setting `model.config.fsdp_shard_size`.
+- **Ulysses Context Parallel (CP)**. Adjust by setting `model_parallel.context_parallel_size`. Ulysses CP requires that the CP size is a factor of `num_heads` (12 for Wan2.1 1.3B, 40 for Wan2.1 14B). When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size. The effective batch size is reduced by a factor of the CP size. 
+- **Selective Activation Checkpointing (SAC)**. Adjust by setting `model.config.net.sac_config.mode`.
+- **Gradient Accumulation**. Adjust by setting `trainer.grad_accum_iter`.
 
-Our training code also support:
+Other distillation baselines (dCM, sCM, DMD):
 - **Pure DMD distillation (JVP-free)** by disabling the sCM loss (setting `model.config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (setting `model.config.dmd_fix_timesteps=True`).
-- **Pure sCM distillation** by setting `model.config.net_fake_score=null` or `model.config.loss_scale_dmd=0`.
+- **Pure sCM distillation (JVP-based)** by setting `model.config.net_fake_score=null` or `model.config.loss_scale_dmd=0`.
 - **Discrete-time CM (JVP-free)** by setting `model.config.cm_type=dcm`.
 
 #### Key Components

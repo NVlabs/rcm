@@ -62,7 +62,7 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
-    from flash_attn_3.flash_attn_interface import flash_attn_func
+    from flash_attn_interface import flash_attn_func
 
     FLASH_ATTN_3_AVAILABLE = True
 except ModuleNotFoundError:
@@ -85,6 +85,38 @@ def get_device_cc(device) -> int:
     return 0
 
 
+_SDPA_CONFIG_CACHE = {}
+
+
+def _get_sdpa_config(device, is_half):
+    key = (device.type, getattr(device, "index", None), is_half)
+    if key in _SDPA_CONFIG_CACHE:
+        return _SDPA_CONFIG_CACHE[key]
+
+    cc = get_device_cc(device)
+    if cc in [90, 100] and is_half:
+        backends = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+    elif is_half:
+        backends = [
+            SDPBackend.FLASH_ATTENTION if cc >= 80 else SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+        ]
+    else:
+        backends = [SDPBackend.EFFICIENT_ATTENTION]
+
+    try:
+        sdpa_kernel(backends=backends, set_priority_order=True)
+        kern = partial(sdpa_kernel, set_priority_order=True)
+    except TypeError:
+        kern = sdpa_kernel
+        backends = [backends[0]]
+
+    result = (cc, backends, kern)
+    _SDPA_CONFIG_CACHE[key] = result
+    return result
+
+
 def attention(
     q,
     k,
@@ -97,19 +129,14 @@ def attention(
 ):
     assert q.dtype == k.dtype and k.dtype == v.dtype
     dtype = q.dtype
-    supported_dtypes = [torch.bfloat16, torch.float16, torch.float32]
-    is_half = dtype in [torch.bfloat16, torch.float16]
-    compute_cap = get_device_cc(q.device)
-
-    if dtype not in supported_dtypes:
-        raise NotImplementedError(f"{dtype=} is not supported.")
+    is_half = dtype in (torch.bfloat16, torch.float16)
 
     if q_scale is not None:
         q = q * q_scale
 
-    # If Flash Attention 3 is installed, and the user's running on a Hopper GPU (compute capability
-    # 9.0, or SM90), use Flash Attention 3.
-    if compute_cap == 90 and FLASH_ATTN_3_AVAILABLE and is_half:
+    cc, backends, kern = _get_sdpa_config(q.device, is_half)
+
+    if cc == 90 and FLASH_ATTN_3_AVAILABLE and is_half:
         return flash_attn_func(
             q=q,
             k=k,
@@ -117,56 +144,24 @@ def attention(
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic,
-        )[0]
-    else:
-        # If Blackwell or Hopper (SM100 or SM90), cuDNN has native FMHA kernels. The Hopper one is
-        # not always as fast as Flash Attention 3, but when Flash Attention is unavailable, it's
-        # still a far better choice than Flash Attention 2 (Ampere).
-        if compute_cap in [90, 100] and is_half:
-            SDPA_BACKENDS = [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-            ]
-            BEST_SDPA_BACKEND = SDPBackend.CUDNN_ATTENTION
-        elif is_half:
-            SDPA_BACKENDS = [
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-            ]
-            BEST_SDPA_BACKEND = SDPBackend.FLASH_ATTENTION if compute_cap >= 80 else SDPBackend.EFFICIENT_ATTENTION
-        else:
-            assert dtype == torch.float32, f"Unrecognized {dtype=}."
-            SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION]
-            BEST_SDPA_BACKEND = SDPBackend.EFFICIENT_ATTENTION
+        )
 
-        if deterministic:
-            raise NotImplementedError("Deterministic mode in attention is only supported when Flash Attention 3 is available.")
+    if deterministic:
+        raise NotImplementedError("Deterministic mode in attention is only supported when Flash Attention 3 is available.")
 
-        # Torch 2.6 and later allows priorities for backends, but for older versions
-        # we can only run with a specific backend. As long as we pick ones we're certain
-        # will work on that device, it should be fine.
-        try:
-            sdpa_kernel(backends=SDPA_BACKENDS, set_priority_order=True)
-            sdpa_kernel_ = partial(sdpa_kernel, set_priority_order=True)
-        except TypeError:
-            sdpa_kernel_ = sdpa_kernel
-            SDPA_BACKENDS = [BEST_SDPA_BACKEND]
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+    with kern(backends=backends):
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=causal,
+            dropout_p=dropout_p,
+            scale=softmax_scale,
+        )
 
-        with sdpa_kernel_(backends=SDPA_BACKENDS):
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=causal,
-                dropout_p=dropout_p,
-                scale=softmax_scale,
-            )
-
-        out = out.transpose(1, 2).contiguous()
-        return out
+    out = out.transpose(1, 2).contiguous()
+    return out

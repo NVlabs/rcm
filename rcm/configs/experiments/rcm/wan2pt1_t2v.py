@@ -148,6 +148,7 @@ WAN2PT1_1PT3B_RES480P_T2V: LazyDict = LazyDict(
                     num_samples=5,
                 ),
             ),
+            grad_accum_iter=1,
         ),
         model_parallel=dict(
             context_parallel_size=1,
@@ -215,6 +216,7 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
                     every_n=250,
                 ),
             ),
+            grad_accum_iter=1,
         ),
         model_parallel=dict(
             context_parallel_size=8,
