@@ -9,14 +9,21 @@
   <a href='https://research.nvidia.com/labs/dir/rcm'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
-**Notice**: rCM will soon support **causal training**, unlocking how *teacher-forcing* (forward-divergence) CM complements *self-forcing* (reverse-divergence) DMD in autoregressive video diffusion distillation!
+**Notice**: rCM will soon support ***causal training***, unlocking how **teacher-forcing** (forward-divergence/offline) CM complements **self-forcing** (reverse-divergence/on-policy) DMD in autoregressive video diffusion distillation!
+
+<p align="center">
+<img src="assets/causal-teaser.png" width=95%>
+  <p align="center">
+    Illustration of <b>Causal-rCM</b>.
+  </p>
+<p>
 
 ## Overview
 
 rCM is the first work that:
 - Scales up **continuous-time consistency distillation (e.g., sCM/MeanFlow)** to 10B+ parameter video diffusion models.
 - Provides open-sourced **FlashAttention-2 Jacobian-vector product (JVP) kernel** with support for parallelisms like FSDP/CP.
-- Identifies the quality bottleneck of sCM and overcomes it via a **forward–reverse divergence joint distillation** framework, showcasing how CM (forward-divergence method) can complement DMD (reverse-KL method) in enhancing diversity.
+- Identifies the quality bottleneck of sCM and overcomes it via a forward–reverse divergence joint distillation framework, showcasing how CM (**forward-divergence/offline** method) can complement DMD (**reverse-KL/on-policy** method) in enhancing diversity.
 - Delivers models that generate videos with both **high quality and strong diversity in only 2~4 steps**.
 
 #### Comparison with Other Diffusion Distillation Methods on Wan2.1 T2V 1.3B (4-step)
